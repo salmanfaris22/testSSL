@@ -1,0 +1,15 @@
+{
+  "name": "aiface-mars-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local attendance server for the ESSL AIFACE-MARS face terminal (ZKTeco ADMS push protocol)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

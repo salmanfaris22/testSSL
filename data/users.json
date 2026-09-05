@@ -1,0 +1,106 @@
+{
+  "1": {
+    "pin": "1",
+    "name": "FASIL",
+    "card": "",
+    "privilege": "14",
+    "sn": "ZHM2255300866",
+    "updated": 1788416584981,
+    "bio": {
+      "BIODATA": 2
+    }
+  },
+  "2": {
+    "pin": "2",
+    "bio": {
+      "BIOPHOTO": 3,
+      "BIODATA": 1,
+      "USERPIC": 2
+    },
+    "name": "Shaffaf",
+    "card": "",
+    "privilege": "14",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198
+  },
+  "3": {
+    "pin": "3",
+    "name": "ABINA TS",
+    "card": "",
+    "privilege": "14",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198,
+    "bio": {
+      "BIODATA": 2,
+      "BIOPHOTO": 1
+    }
+  },
+  "4": {
+    "pin": "4",
+    "name": "HR",
+    "card": "5428935",
+    "privilege": "14",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541197
+  },
+  "6": {
+    "pin": "6",
+    "name": "Shyam",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "7": {
+    "pin": "7",
+    "name": "Shaab",
+    "card": "",
+    "privilege": "14",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198,
+    "bio": {
+      "BIODATA": 2,
+      "BIOPHOTO": 1
+    }
+  },
+  "8": {
+    "pin": "8",
+    "name": "anandu rajendran",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198,
+    "bio": {
+      "BIODATA": 2,
+      "BIOPHOTO": 1
+    }
+  },
+  "9": {
+    "pin": "9",
+    "name": "aswanth p",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198,
+    "bio": {
+      "BIODATA": 2,
+      "BIOPHOTO": 1
+    }
+  },
+  "10": {
+    "pin": "10",
+    "name": "Salman",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788413541198,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  }
+}
