@@ -428,6 +428,9 @@ function filterLogs(q) {
 }
 
 async function handleApi(req, res, route, q) {
+  if (route === '/health' || route === '/api/health') {
+    return jsonOut(res, { status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
+  }
   if (route === '/api/state') {
     const rows = filterLogs(q).slice(0, Number(q.get('limit') || 200));
     const today = new Date().toISOString().slice(0, 10);
