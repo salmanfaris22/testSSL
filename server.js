@@ -826,7 +826,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (route.startsWith('/iclock')) return await handleDevice(req, res, route, query);
-    if (route.startsWith('/api/')) return await handleApi(req, res, route, query);
+    if (route === '/health' || route.startsWith('/api/')) return await handleApi(req, res, route, query);
     if (route === '/' || route === '/index.html') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(HTML);
