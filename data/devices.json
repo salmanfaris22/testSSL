@@ -12,7 +12,8 @@
     "stamp": "9999",
     "opStamp": "9999",
     "online": false,
-    "lastCmd": 1788416784202
+    "lastCmd": 1788416784202,
+    "role": "out"
   },
   "ZHM2255300881": {
     "sn": "ZHM2255300881",
@@ -26,6 +27,7 @@
     },
     "stamp": "9999",
     "opStamp": "9999",
-    "online": true
+    "online": true,
+    "role": "in"
   }
 }

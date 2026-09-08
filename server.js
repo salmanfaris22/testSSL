@@ -320,7 +320,7 @@ function handshake(sn) {
     'TimeZone=' + off,
     'Realtime=1',
     'Encrypt=0',
-    'ServerVer=2.4.1 ' + new Date().toISOString().slice(0, 10),
+    'ServerVer=2.4.1 ' + localDate(new Date()),
     'PushProtVer=2.4.1',
     'MultiBioDataSupport=0:1:0:0:0:0:0:0:1:0',
     'MultiBioPhotoSupport=0:0:0:0:0:0:0:0:1:0',
@@ -418,6 +418,110 @@ function dirOf(rec) {
   return (d && d.role) || '';
 }
 
+/* ------------------------------------------------------- attendance model */
+
+const DEDUP_MS = 60000;   // terminal double-reads: PIN 2 punched at :09 and :10
+
+const tsOf = (t) => Date.parse(t.replace(' ', 'T')) || 0;
+const dayOf = (t) => t.slice(0, 10);
+
+// One day's punches -> ordered, de-duplicated, labelled events.
+// Direction comes from the gate role; with no roles assigned we fall back to
+// alternating from the first punch (first = in, next = out, ...).
+function dayEvents(pin, date) {
+  const raw = state.logs
+    .filter((r) => r.pin === pin && dayOf(r.time) === date)
+    .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+
+  const evs = [];
+  for (const r of raw) {
+    const d = dirOf(r);
+    const prev = evs[evs.length - 1];
+    if (prev && prev.dir === d && tsOf(r.time) - tsOf(prev.time) < DEDUP_MS) continue;
+    evs.push({ time: r.time, dir: d, verify: r.verify, sn: r.sn });
+  }
+  const anyRole = evs.some((e) => e.dir);
+  evs.forEach((e, i) => { if (!anyRole) e.dir = i % 2 === 0 ? 'in' : 'out'; });
+
+  // Staff often tap the same terminal several times. A run of same-direction
+  // punches is one real movement: keep the first, mark the rest as repeats so
+  // they show in the timeline but never create a phantom break.
+  let held = null;
+  for (const e of evs) { e.repeat = e.dir === held; if (!e.repeat) held = e.dir; }
+
+  const core = evs.filter((e) => !e.repeat);
+  const dirs = core.map((e) => e.dir);
+  const firstIn = dirs.indexOf('in');
+  const lastOut = dirs.lastIndexOf('out');
+  core.forEach((e, i) => {
+    if (i === firstIn) e.label = 'Check in';
+    else if (i === lastOut && lastOut > firstIn) e.label = 'Check out';
+    else if (lastOut > -1 && i > lastOut) e.label = 'Extra punch';
+    else e.label = e.dir === 'out' ? 'Break start' : 'Break end';
+  });
+  evs.forEach((e) => { if (e.repeat) e.label = 'Repeat punch'; });
+  return evs;
+}
+
+function daySummary(pin, date) {
+  const evs = dayEvents(pin, date);
+  const inEv = evs.find((e) => e.label === 'Check in');
+  const outEv = evs.slice().reverse().find((e) => e.label === 'Check out');
+
+  let breakMin = 0;
+  for (let i = 0; i < evs.length; i++) {
+    if (evs[i].label !== 'Break start') continue;
+    const end = evs.slice(i + 1).find((e) => e.label === 'Break end' || e.label === 'Check out');
+    if (end && end.label === 'Break end') {
+      breakMin += Math.round((tsOf(end.time) - tsOf(evs[i].time)) / 60000);
+    }
+  }
+  const totalMin = inEv && outEv ? Math.round((tsOf(outEv.time) - tsOf(inEv.time)) / 60000) : 0;
+  const dow = new Date(date + 'T00:00:00').getDay();
+  return {
+    date, dow,
+    status: evs.length ? 'Present' : (dow === 0 ? 'Weekly off' : 'Absent'),
+    in: inEv ? inEv.time : '', out: outEv ? outEv.time : '',
+    incomplete: !!(evs.length && (!inEv || !outEv)),
+    punches: evs.length, breakMin, totalMin,
+    effectiveMin: Math.max(0, totalMin - breakMin),
+    events: evs,
+  };
+}
+
+const localDate = (d) => d.getFullYear() + '-'
+  + String(d.getMonth() + 1).padStart(2, '0') + '-'
+  + String(d.getDate()).padStart(2, '0');
+
+function dateRange(from, to) {
+  const out = [];
+  const d = new Date(from + 'T00:00:00');
+  const end = new Date(to + 'T00:00:00');
+  while (d <= end && out.length < 400) { out.push(localDate(d)); d.setDate(d.getDate() + 1); }
+  return out;
+}
+
+function attendance(pin, from, to) {
+  const dates = dateRange(from, to);
+  const days = dates.map((d) => daySummary(pin, d));
+  const present = days.filter((d) => d.status === 'Present');
+  const sum = (k) => present.reduce((a, d) => a + d[k], 0);
+  return {
+    pin,
+    name: (state.users[pin] && state.users[pin].name) || '',
+    days: days.slice().reverse(),
+    totals: {
+      totalDays: days.length,
+      present: present.length,
+      absent: days.filter((d) => d.status === 'Absent').length,
+      sundays: days.filter((d) => d.dow === 0).length,
+      totalMin: sum('totalMin'),
+      breakMin: sum('breakMin'),
+      effectiveMin: sum('effectiveMin'),
+    },
+  };
+}
+
 function filterLogs(q) {
   const term = (q.get('q') || '').toLowerCase();
   const fPin = (q.get('pin') || '').trim().toLowerCase();
@@ -451,9 +555,20 @@ async function handleApi(req, res, route, q) {
   if (route === '/health' || route === '/api/health') {
     return jsonOut(res, { status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
   }
+  if (route === '/api/attendance') {
+    const today = localDate(new Date());
+    const to = q.get('to') || today;
+    const from = q.get('from') || to;
+    const pin = q.get('pin');
+    if (pin) return jsonOut(res, attendance(pin, from, to));
+    const rows = Object.keys(state.users)
+      .map((p) => { const a = attendance(p, from, to); return { pin: p, name: a.name, totals: a.totals }; })
+      .sort((a, b) => Number(a.pin) - Number(b.pin));
+    return jsonOut(res, { from, to, rows });
+  }
   if (route === '/api/state') {
     const rows = filterLogs(q).slice(0, Number(q.get('limit') || 200));
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDate(new Date());
     return jsonOut(res, {
       now: Date.now(),
       port: PORT,
@@ -595,6 +710,35 @@ code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radi
     <div class="card"><div class="k">Total punches</div><div class="v" id="cTotal">0</div></div>
     <div class="card"><div class="k">Enrolled users</div><div class="v" id="cUsers">0</div></div>
     <div class="card"><div class="k">Devices</div><div class="v" id="cDev">0</div></div>
+  </div>
+
+  <div class="panel" style="margin-bottom:16px">
+    <h2>Employee attendance
+      <span class="row"><button onclick="attCsv()">Download CSV</button></span>
+    </h2>
+    <div class="body row">
+      <select id="aUser" style="min-width:220px" onchange="loadAtt()"><option value="">Select an employee...</option></select>
+      <input id="aFrom" type="date" style="width:150px" onchange="loadAtt()">
+      <input id="aTo" type="date" style="width:150px" onchange="loadAtt()">
+    </div>
+    <div id="aKpis"></div>
+    <div class="scroll">
+      <table><thead><tr><th>Date</th><th>Status</th><th>Check-in &ndash; Check-out</th>
+      <th>Total hours</th><th>Break</th><th>Effective hours</th><th>Punches</th></tr></thead>
+      <tbody id="tbAtt"></tbody></table>
+      <div class="empty" id="emptyAtt">Pick an employee to see their daily log.</div>
+    </div>
+  </div>
+
+  <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50" onclick="closeModal(event)">
+    <div style="max-width:560px;margin:6vh auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden" onclick="event.stopPropagation()">
+      <div style="padding:16px 18px;border-bottom:1px solid var(--line)">
+        <b id="mTitle"></b><div class="hint" id="mDate"></div>
+      </div>
+      <div style="padding:8px 18px;max-height:58vh;overflow:auto" id="mBody"></div>
+      <div style="padding:12px 18px;border-top:1px solid var(--line)">
+        <button style="width:100%" onclick="closeModal()">Done</button></div>
+    </div>
   </div>
 
   <div class="cols">
@@ -797,7 +941,7 @@ function render(s){
         + '</div>'
         + '<div class="row" style="margin-top:6px;align-items:center">'
         + '<span class="hint">Gate role</span>'
-        + '<select onchange="setRole(\'' + esc(d.sn) + '\', this.value)">'
+        + '<select data-sn="' + esc(d.sn) + '" onchange="setRole(this.dataset.sn, this.value)">'
         + '<option value=""' + (d.role ? '' : ' selected') + '>Unassigned</option>'
         + '<option value="in"' + (d.role === 'in' ? ' selected' : '') + '>Check-in terminal</option>'
         + '<option value="out"' + (d.role === 'out' ? ' selected' : '') + '>Check-out terminal</option>'
@@ -822,6 +966,24 @@ function render(s){
   }
   q('tbLogs').innerHTML = tb;
   q('emptyLogs').style.display = s.logs.length ? 'none' : 'block';
+
+  var sel = q('aUser');
+  if (sel.options.length - 1 !== s.users.length){
+    var keep = sel.value;
+    sel.innerHTML = '<option value="">Select an employee...</option>';
+    s.users.forEach(function(u){
+      var o = document.createElement('option');
+      o.value = u.pin; o.textContent = (u.name || '(no name)') + '  -  PIN ' + u.pin;
+      sel.appendChild(o);
+    });
+    sel.value = keep;
+  }
+  if (!q('aTo').value){
+    var now = new Date(), pad = function(x){ return String(x).padStart(2,'0'); };
+    var iso = function(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); };
+    q('aTo').value = iso(now);
+    q('aFrom').value = iso(new Date(now.getTime() - 7*86400000));
+  }
 
   // users
   var ub = '';
@@ -889,6 +1051,89 @@ function setRole(sn, role){
   fetch('/api/role', { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ sn: sn, role: role }) }).then(refresh);
 }
+var ATT = null;
+function hm(m){ return (m/60|0) + 'h ' + (m%60) + 'm'; }
+
+function loadAtt(){
+  var pin = q('aUser').value;
+  q('emptyAtt').style.display = pin ? 'none' : 'block';
+  if (!pin){ q('tbAtt').innerHTML=''; q('aKpis').innerHTML=''; ATT=null; return; }
+  var p = new URLSearchParams({pin:pin, from:q('aFrom').value, to:q('aTo').value});
+  fetch('/api/attendance?' + p.toString()).then(function(r){return r.json();}).then(renderAtt);
+}
+
+function renderAtt(a){
+  ATT = a;
+  var t = a.totals;
+  q('aKpis').innerHTML = '<div class="grid">'
+    + kpi('Total days', t.totalDays) + kpi('Present', t.present, 'var(--ok)')
+    + kpi('Absent', t.absent, t.absent ? 'var(--bad)' : '') + kpi('Sundays', t.sundays)
+    + kpi('Total hours', hm(t.totalMin)) + kpi('Break', hm(t.breakMin), 'var(--warn)')
+    + kpi('Effective hours', hm(t.effectiveMin), 'var(--ok)') + '</div>';
+
+  var tb = '';
+  for (var i = 0; i < a.days.length; i++){
+    var d = a.days[i];
+    var f = fmtStamp(d.date + ' 00:00');
+    var col = d.status === 'Present' ? 'var(--ok)' : d.status === 'Absent' ? 'var(--bad)' : 'var(--dim)';
+    var span = d.in && d.out ? fmtStamp(d.in).time + ' - ' + fmtStamp(d.out).time
+             : d.in ? fmtStamp(d.in).time + ' - <span style="color:var(--warn)">no check-out</span>'
+             : '<span style="color:#8b949e">Not marked</span>';
+    tb += '<tr style="cursor:pointer" onclick="openDay(' + i + ')">'
+       + '<td>' + esc(f.date) + '</td>'
+       + '<td style="color:' + col + '">' + esc(d.status) + '</td>'
+       + '<td class="mono">' + span + '</td>'
+       + '<td>' + hm(d.totalMin) + '</td><td>' + hm(d.breakMin) + '</td>'
+       + '<td><b>' + hm(d.effectiveMin) + '</b></td>'
+       + '<td class="mono" style="color:#8b949e">' + d.punches + '</td></tr>';
+  }
+  q('tbAtt').innerHTML = tb;
+  q('emptyAtt').style.display = a.days.length ? 'none' : 'block';
+}
+function kpi(k, v, col){
+  return '<div class="card"><div class="k">' + k + '</div><div class="v"'
+    + (col ? ' style="color:' + col + '"' : '') + '>' + v + '</div></div>';
+}
+
+var DOT = {'Check in':'var(--ok)','Check out':'var(--warn)','Break start':'var(--warn)',
+           'Break end':'var(--ok)','Repeat punch':'#8b949e','Extra punch':'#8b949e'};
+function openDay(i){
+  var d = ATT.days[i];
+  q('mTitle').textContent = ATT.name || ('PIN ' + ATT.pin);
+  q('mDate').textContent = d.date + '  -  ' + hm(d.effectiveMin) + ' effective';
+  if (!d.events.length){ q('mBody').innerHTML = '<div class="empty">No punches on this day.</div>'; }
+  else {
+    q('mBody').innerHTML = d.events.map(function(e){
+      var dim = e.label === 'Repeat punch' || e.label === 'Extra punch';
+      return '<div style="display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #1c222b'
+        + (dim ? ';opacity:.5' : '') + '">'
+        + '<div style="width:9px;height:9px;border-radius:9px;margin-top:5px;flex:0 0 auto;background:'
+        + (DOT[e.label] || '#8b949e') + '"></div><div>'
+        + '<div><b>' + esc(e.label) + '</b></div>'
+        + '<div class="hint">' + esc(fmtStamp(e.time).time) + ' &middot; '
+        + esc(LAB.verify[e.verify] || ('mode ' + e.verify)) + ' &middot; gate ' + esc(e.sn) + '</div>'
+        + '</div></div>';
+    }).join('');
+  }
+  q('modal').style.display = 'block';
+}
+function closeModal(e){ if (!e || e.target === q('modal')) q('modal').style.display = 'none'; }
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeModal(); });
+
+function attCsv(){
+  if (!ATT) return;
+  var rows = [['Date','Status','Check in','Check out','Total','Break','Effective','Punches']];
+  ATT.days.forEach(function(d){
+    rows.push([d.date, d.status, fmtStamp(d.in).time, fmtStamp(d.out).time,
+               hm(d.totalMin), hm(d.breakMin), hm(d.effectiveMin), d.punches]);
+  });
+  var csv = rows.map(function(r){ return r.join(','); }).join(String.fromCharCode(10));
+  var a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'attendance-' + (ATT.name || ATT.pin) + '.csv';
+  a.click();
+}
+
 function exportCsv(){ window.location = '/api/export.csv?' + params().toString(); }
 
 refresh();
