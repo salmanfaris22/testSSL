@@ -10,6 +10,11 @@
  */
 'use strict';
 
+// The terminals send naive local timestamps in Indian time, so the process is
+// pinned to the same zone. Without this a UTC host (Render) groups punches
+// into the wrong day between 00:00 and 05:30 IST. Override with APP_TZ.
+process.env.TZ = process.env.APP_TZ || 'Asia/Kolkata';
+
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
@@ -57,6 +62,8 @@ function loadState() {
     for (const sn of Object.keys(state.devices)) {
       const d = state.devices[sn];
       d.online = false;
+      if (ROLE_IN.includes(sn)) d.role = 'in';
+      else if (ROLE_OUT.includes(sn)) d.role = 'out';
       // the old parser stuffed the whole comma-separated INFO line into one
       // key; re-split it so Firmware / Faces / Users / Logs resolve
       for (const [k, v] of Object.entries(d.info || {})) {
@@ -459,7 +466,17 @@ function dayEvents(pin, date) {
     evs.push({ time: r.time, dir: d, verify: r.verify, sn: r.sn });
   }
   const anyRole = evs.some((e) => e.dir);
-  evs.forEach((e, i) => { if (!anyRole) e.dir = i % 2 === 0 ? 'in' : 'out'; });
+  if (!anyRole) {
+    // No gate roles assigned: the only defensible reading is first punch in,
+    // last punch out. Everything between is unknown, so no break is claimed.
+    evs.forEach((e, i) => {
+      e.dir = i === evs.length - 1 && evs.length > 1 ? 'out' : 'in';
+      e.repeat = i > 0 && i < evs.length - 1;
+      e.label = i === 0 ? 'Check in'
+              : (i === evs.length - 1 && evs.length > 1) ? 'Check out' : 'Repeat punch';
+    });
+    return evs;
+  }
 
   // Staff often tap the same terminal several times. A run of same-direction
   // punches is one real movement: keep the first, mark the rest as repeats so
@@ -474,6 +491,7 @@ function dayEvents(pin, date) {
   core.forEach((e, i) => {
     if (i === firstIn) e.label = 'Check in';
     else if (i === lastOut && lastOut > firstIn) e.label = 'Check out';
+    else if (firstIn > -1 && i < firstIn) e.label = 'Extra punch';
     else if (lastOut > -1 && i > lastOut) e.label = 'Extra punch';
     else e.label = e.dir === 'out' ? 'Break start' : 'Break end';
   });
@@ -703,6 +721,7 @@ async function handleApi(req, res, route, q) {
     return jsonOut(res, {
       now: Date.now(),
       port: PORT,
+      tz: process.env.TZ,
       ips: lanIPs(),
       devices: Object.values(state.devices).sort((a, b) => b.lastSeen - a.lastSeen),
       users: Object.values(state.users).sort((a, b) => Number(a.pin) - Number(b.pin)),
@@ -1086,7 +1105,7 @@ function render(s){
   q('cTotal').textContent = s.totals.logs;
   q('cUsers').textContent = s.totals.users;
   q('cDev').textContent   = s.totals.devices;
-  q('hdrPort').textContent = 'listening on port ' + s.port;
+  q('hdrPort').textContent = 'port ' + s.port + ' - ' + (s.tz || 'local time');
   q('hdrTick').textContent = 'updated ' + new Date().toLocaleTimeString();
 
   var online = s.devices.filter(function(d){ return d.online; });
