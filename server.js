@@ -32,8 +32,32 @@ const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boo
 // time carries the stamp 06:04:09. Shift on ingest so everything downstream
 // (day grouping, filters, exports) works in Indian time. Set to 0 if you
 // reconfigure the terminals to local time.
-const DEVICE_OFFSET_MIN = Number(
-  process.env.DEVICE_OFFSET_MIN === undefined ? 330 : process.env.DEVICE_OFFSET_MIN);
+const FORCED_OFFSET = process.env.DEVICE_OFFSET_MIN === undefined
+  ? null : Number(process.env.DEVICE_OFFSET_MIN);
+
+// A live push arrives within seconds of the punch, so (now - stamp) reveals the
+// terminal's clock offset. Backlog uploads show huge deltas and are ignored for
+// detection - they reuse whatever the device last measured. Fix the terminal's
+// timezone to GMT+5:30 and this settles back to 0 on its own.
+function clockOffsetFor(sn, devTime) {
+  if (FORCED_OFFSET !== null) return FORCED_OFFSET;
+  const d = state.devices[sn];
+  const parsed = Date.parse(String(devTime).replace(' ', 'T'));
+  if (parsed) {
+    const delta = Math.round((Date.now() - parsed) / 60000);
+    for (const cand of [0, 330]) {
+      if (Math.abs(delta - cand) <= 10) {
+        if (d && d.clockOffset !== cand) {
+          d.clockOffset = cand;
+          trace('info', sn, 'clock offset detected: ' + cand + ' min');
+          saveSoon();
+        }
+        return cand;
+      }
+    }
+  }
+  return (d && d.clockOffset) || 0;
+}
 
 function shiftStamp(t, mins) {
   const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(t || '');
@@ -62,24 +86,14 @@ const seen = new Set();          // dedupe key for punches
 let cmdSeq = Date.now() % 100000;
 
 function loadState() {
-  let migrated = 0;
   try {
     for (const line of fs.readFileSync(ATT_FILE, 'utf8').split('\n')) {
       if (!line.trim()) continue;
       const r = JSON.parse(line);
-      if (r.devTime === undefined) { r.devTime = r.time; r.time = shiftStamp(r.time, DEVICE_OFFSET_MIN); migrated++; }
       state.logs.push(r);
       seen.add(r.sn + '|' + r.pin + '|' + r.time + '|' + r.status);
     }
   } catch (e) { /* first run */ }
-  if (migrated) {
-    try {
-      fs.copyFileSync(ATT_FILE, ATT_FILE + '.pre-tz-backup');
-      fs.writeFileSync(ATT_FILE, state.logs.map((r) => JSON.stringify(r)).join('\n') + '\n');
-      console.log('  Shifted ' + migrated + ' stored punches by ' + DEVICE_OFFSET_MIN
-        + ' min into local time (backup: attlog.jsonl.pre-tz-backup)');
-    } catch (e) { console.error('  tz migration write failed: ' + e.message); }
-  }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
   try { Object.assign(state.settings, JSON.parse(fs.readFileSync(SET_FILE, 'utf8'))); } catch (e) {}
   try {
@@ -214,7 +228,7 @@ const STATUS = {
 };
 
 function addPunch(sn, pin, devTime, status, verify, workcode, extra) {
-  const time = shiftStamp(devTime, DEVICE_OFFSET_MIN);
+  const time = shiftStamp(devTime, clockOffsetFor(sn, devTime));
   const key = sn + '|' + pin + '|' + time + '|' + status;
   if (seen.has(key)) return false;
   seen.add(key);
@@ -473,6 +487,27 @@ function dirOf(rec) {
 
 const DEDUP_MS = 60000;   // terminal double-reads: PIN 2 punched at :09 and :10
 
+// The two terminals sit close together, so one reads the RFID card while the
+// other takes the face. That yields two genuine records - each device stamps
+// its own transaction counter - seconds apart on opposite gates. Neither is a
+// server duplicate, so we keep both on record and ignore the accidental one.
+const CROSS_DUP_SEC = Number(
+  process.env.CROSS_DUP_SEC === undefined ? 20 : process.env.CROSS_DUP_SEC);
+
+function markCrossGateDupes(rows) {
+  for (let i = 0; i < rows.length; i++) {
+    for (let j = i + 1; j < rows.length; j++) {
+      if ((tsOf(rows[j].time) - tsOf(rows[i].time)) / 1000 > CROSS_DUP_SEC) break;
+      if (rows[i].sn === rows[j].sn) continue;
+      const a = rows[i], b = rows[j];
+      // a card read beats nothing: prefer the deliberate face/finger punch
+      const loser = (a.verify === 2 && b.verify !== 2) ? a : b;
+      loser.crossDup = true;
+    }
+  }
+  return rows;
+}
+
 const tsOf = (t) => Date.parse(t.replace(' ', 'T')) || 0;
 const dayOf = (t) => t.slice(0, 10);
 
@@ -480,9 +515,13 @@ const dayOf = (t) => t.slice(0, 10);
 // Direction comes from the gate role; with no roles assigned we fall back to
 // alternating from the first punch (first = in, next = out, ...).
 function dayEvents(pin, date) {
-  const raw = state.logs
+  const all = state.logs
     .filter((r) => r.pin === pin && dayOf(r.time) === date)
-    .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+    .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0))
+    .map((r) => Object.assign({}, r));
+  markCrossGateDupes(all);
+  const raw = all.filter((r) => !r.crossDup);
+  const crossDupes = all.length - raw.length;
 
   const evs = [];
   for (const r of raw) {
@@ -501,6 +540,7 @@ function dayEvents(pin, date) {
       e.label = i === 0 ? 'Check in'
               : (i === evs.length - 1 && evs.length > 1) ? 'Check out' : 'Repeat punch';
     });
+    evs.crossDupes = crossDupes;
     return evs;
   }
 
@@ -522,6 +562,7 @@ function dayEvents(pin, date) {
     else e.label = e.dir === 'out' ? 'Break start' : 'Break end';
   });
   evs.forEach((e) => { if (e.repeat) e.label = 'Repeat punch'; });
+  evs.crossDupes = crossDupes;
   return evs;
 }
 
@@ -557,7 +598,7 @@ function daySummary(pin, date) {
     status: evs.length ? 'Present' : (dow === 0 ? 'Weekly off' : 'Absent'),
     in: inEv ? inEv.time : '', out: outEv ? outEv.time : '',
     incomplete: !!(evs.length && (!inEv || !outEv)),
-    punches: evs.length, breakMin, totalMin, breaks,
+    punches: evs.length, crossDupes: evs.crossDupes || 0, breakMin, totalMin, breaks,
     workMin: Math.max(0, totalMin - breakMin),
     events: evs,
   };
