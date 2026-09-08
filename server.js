@@ -497,7 +497,17 @@ async function handleDevice(req, res, route, q) {
         item.result = p.get('Return');
         trace('dev', sn, 'cmd ' + id + ' (' + item.cmd.split(' ')[0] + ') returned ' + item.result);
         if (item.kind === 'unlock') onUnlockReply(sn, item);
-        else if (item.kind === 'unlock-probe') item.ok = Number(item.result) === 0;
+        else if (item.kind === 'unlock-probe') {
+          item.ok = returnedOk(item);
+          // learning which wording works is the whole point of the test, so
+          // keep it for the next real press
+          const dev = state.devices[sn];
+          if (item.ok && dev && dev.unlockCmd !== item.cmd) {
+            dev.unlockCmd = item.cmd;
+            trace('info', sn, 'unlock form learned from test: ' + item.cmd);
+            saveSoon();
+          }
+        }
       } else {
         trace('dev', sn, 'devicecmd: ' + line.slice(0, 120));
       }
@@ -515,10 +525,16 @@ async function handleDevice(req, res, route, q) {
 // Return=0 is the firmware's "done". Anything else means this build does not
 // know the wording, so we move on to the next form and let the operator see
 // only the final outcome.
+// A reply only counts as acceptance when the terminal actually sent Return=0.
+// Number(null) is 0, so a missing field must not read as success.
+function returnedOk(item) {
+  return item.result !== null && item.result !== undefined && String(item.result).trim() !== ''
+    && Number(item.result) === 0;
+}
+
 function onUnlockReply(sn, item) {
   const d = state.devices[sn];
-  const ok = Number(item.result) === 0;
-  if (ok) {
+  if (returnedOk(item)) {
     item.ok = true;
     if (d && d.unlockCmd !== item.cmd) { d.unlockCmd = item.cmd; saveSoon(); }
     // Return=0 means the terminal accepted the command. Whether a lock
@@ -1146,15 +1162,52 @@ box-shadow:0 14px 36px rgba(0,0,0,.55);font-size:13px;max-width:min(560px,92vw)}
 .toast.ok{border-color:rgba(34,197,94,.5)}
 .toast.bad{border-color:rgba(239,68,68,.5)}
 td.num{font-variant-numeric:tabular-nums}
+.tabs{display:flex;gap:4px;padding:0 20px;background:var(--panel);
+border-bottom:1px solid var(--line);position:sticky;top:53px;z-index:9;overflow-x:auto}
+.tabs::-webkit-scrollbar{display:none}
+.tab{background:transparent;border:0;border-radius:0;color:var(--dim);padding:12px 15px;
+font-size:13px;white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab:hover{color:var(--fg)}
+.tab.on{color:#fff;border-bottom-color:var(--accent)}
+.tab .n{margin-left:6px;font-size:10.5px;padding:1px 6px;border-radius:20px;
+background:#21262d;color:var(--dim)}
+section[hidden]{display:none}
+/* the big in-dashboard door button, same language as the kiosk page */
+button.door{width:190px;height:190px;border-radius:50%;border:0;color:#fff;
+font:600 17px/1.2 inherit;cursor:pointer;padding:0;
+background:linear-gradient(160deg,#4c8dff,#2563eb 62%,#1d4ed8);
+box-shadow:0 16px 40px rgba(37,99,235,.4),inset 0 1px 0 rgba(255,255,255,.28);
+transition:transform .14s cubic-bezier(.2,.7,.3,1),background .3s,box-shadow .25s}
+button.door:hover{border-color:transparent;transform:translateY(-2px)}
+button.door:active{transform:scale(.96)}
+button.door.busy{background:linear-gradient(160deg,#3f7ae0,#1e51c9)}
+button.door.ok{background:linear-gradient(160deg,#34d27a,#16a34a 62%,#15803d);
+box-shadow:0 16px 40px rgba(34,197,94,.4),inset 0 1px 0 rgba(255,255,255,.28)}
+button.door.bad{background:linear-gradient(160deg,#f87171,#dc2626 62%,#b91c1c);
+box-shadow:0 16px 40px rgba(239,68,68,.38),inset 0 1px 0 rgba(255,255,255,.28)}
+h1{font-size:15px}
+@media(max-width:820px){.tabs{top:auto;position:static}}
 </style></head><body>
 <header>
-  <h1>AIFACE-MARS &middot; Attendance Server</h1>
+  <h1>AIFACE-MARS <span style="color:var(--dim);font-weight:400">Attendance</span></h1>
   <span class="badge" id="hdrPort"></span>
   <span class="badge" id="hdrDev">no device</span>
   <span style="flex:1"></span>
   <span class="badge" id="hdrTick">-</span>
 </header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab on" data-tab="att">Attendance</button>
+  <button class="tab" data-tab="log">Live log</button>
+  <button class="tab" data-tab="door">Door</button>
+  <button class="tab" data-tab="dev">Devices</button>
+  <button class="tab" data-tab="srv">Server &amp; API</button>
+</nav>
+
 <div class="wrap">
+
+<!-- ------------------------------------------------------------ attendance -->
+<section data-panel="att">
   <div class="grid">
     <div class="card"><div class="k">Punches today</div><div class="v" id="cToday">0</div></div>
     <div class="card"><div class="k">Total punches</div><div class="v" id="cTotal">0</div></div>
@@ -1162,7 +1215,7 @@ td.num{font-variant-numeric:tabular-nums}
     <div class="card"><div class="k">Devices</div><div class="v" id="cDev">0</div></div>
   </div>
 
-  <div class="panel" style="margin-bottom:16px">
+  <div class="panel">
     <h2>Employee attendance
       <span class="row">
         <span class="tag face" id="aRule">Face verified only</span>
@@ -1195,121 +1248,140 @@ td.num{font-variant-numeric:tabular-nums}
     </div>
     <div class="body note" id="aFoot" style="border-top:1px solid var(--line)"></div>
   </div>
+</section>
 
-  <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50" onclick="closeModal(event)">
-    <div style="max-width:560px;margin:6vh auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden" onclick="event.stopPropagation()">
-      <div style="padding:16px 18px;border-bottom:1px solid var(--line)">
-        <b id="mTitle"></b><div class="hint" id="mDate"></div>
-      </div>
-      <div style="padding:8px 18px;max-height:58vh;overflow:auto" id="mBody"></div>
-      <div style="padding:12px 18px;border-top:1px solid var(--line)">
-        <button style="width:100%" onclick="closeModal()">Done</button></div>
-    </div>
-  </div>
-
-  <div class="panel" style="margin-bottom:16px">
-    <h2>Server &amp; HR API
-      <span class="row"><button onclick="loadStats()">Refresh</button></span>
+<!-- ------------------------------------------------------------------- log -->
+<section data-panel="log" hidden>
+  <div class="panel">
+    <h2>Attendance log
+      <span class="row">
+        <button onclick="exportCsv()">Export CSV</button>
+        <button class="d" onclick="purge()">Clear history</button>
+      </span>
     </h2>
-    <div id="statBox" class="body"><div class="hint">Loading...</div></div>
-    <div class="body" style="border-top:1px solid var(--line)">
-      <div class="hint" style="margin-bottom:8px">
-        Read-only API for your HR system. Only the IP addresses listed here can call it &mdash;
-        an empty list blocks everyone. Your current IP is <b id="myIp">?</b>.
-      </div>
-      <div class="row">
-        <input id="ipList" placeholder="103.119.254.234, 49.37.0.0  (comma separated, * = any)" style="flex:1;min-width:240px">
-        <button class="p" onclick="saveIps()">Save allow-list</button>
-        <button onclick="useMyIp()">Use my IP</button>
-      </div>
-      <div class="row" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)">
-        <span class="note" style="flex:1 1 200px">Attendance rules &mdash; these apply to the
-        dashboard, the CSV exports and the HR API.</span>
-        <label class="note"><input type="checkbox" id="setFace" style="width:auto;margin-right:6px"
-          onchange="saveRules()">Count face-verified punches only</label>
-        <label class="note">Re-tap window
-          <input id="setDwell" type="number" min="0" max="60" style="width:70px;margin:0 6px"
-            onchange="saveRules()"> min</label>
-      </div>
-      <div class="note" id="ruleMsg" style="margin-top:6px"></div>
-      <div class="row" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)">
-        <span class="note" style="flex:1 1 200px">Door button page
-          <a href="/opendoor" target="_blank" style="color:var(--accent)">/opendoor</a> &mdash;
-          anyone who can reach this server can open the door. Set a code to gate it.</span>
-        <input id="doorPin" placeholder="door code (blank = no code)" style="width:210px">
-        <button onclick="saveDoorPin()">Save code</button>
-      </div>
-      <div class="note" id="doorPinMsg" style="margin-top:6px"></div>
-      <div id="ipMsg" class="hint" style="margin-top:8px"></div>
-      <div class="hint" style="margin-top:10px">
-        <b>Endpoints</b> &mdash; share these with HR:<br>
-        <span class="mono" id="hrUrls"></span>
-      </div>
+    <div class="body row">
+      <input id="fq" placeholder="Search anything" style="flex:1;min-width:140px" oninput="debounced()">
+      <input id="fpin" placeholder="PIN" style="width:90px" oninput="debounced()">
+      <input id="fname" placeholder="Name" style="width:140px" oninput="debounced()">
+      <select id="fdir" style="width:130px" onchange="refresh()">
+        <option value="">Type: all</option>
+        <option value="in">Check-in</option>
+        <option value="out">Check-out</option>
+        <option value="none">Unassigned</option>
+      </select>
+      <select id="fverify" style="width:160px" onchange="refresh()">
+        <option value="face">Verified by: Face</option>
+        <option value="">Verified by: all</option>
+      </select>
+      <input id="ffrom" type="date" style="width:150px" onchange="refresh()">
+      <input id="fto" type="date" style="width:150px" onchange="refresh()">
+      <button onclick="clearFilters()">Reset</button>
+    </div>
+    <div class="scroll" style="max-height:620px">
+      <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th></tr></thead>
+      <tbody id="tbLogs"></tbody></table>
+      <div class="empty" id="emptyLogs">Waiting for the first punch from the device...</div>
     </div>
   </div>
 
+  <div class="panel">
+    <h2>Users on device</h2>
+    <div class="scroll" style="max-height:300px">
+      <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
+      <tbody id="tbUsers"></tbody></table>
+      <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull users</b> on the Devices tab.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------------ door -->
+<section data-panel="door" hidden>
   <div class="cols">
     <div>
       <div class="panel">
-        <h2>Attendance log
+        <h2>Open the door
+          <span class="row"><a href="/opendoor" target="_blank"><button>Full-screen page</button></a></span>
+        </h2>
+        <div class="body" style="text-align:center;padding:26px 16px">
+          <button class="door" id="bigDoor" onclick="openDoor()">
+            <svg viewBox="0 0 32 32" width="40" height="40" style="display:block;margin:0 auto 8px">
+              <path d="M20 5H9a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h11" fill="none" stroke="#fff"
+                stroke-width="2" stroke-linecap="round"/>
+              <path d="M20 16h6m-3-3 3 3-3 3" fill="none" stroke="#fff" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Open door
+          </button>
+          <div class="note" id="doorMsg" style="margin-top:16px">
+            Unlocks every terminal that is online.
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Door diagnostics
           <span class="row">
-            <button onclick="exportCsv()">Export CSV</button>
-            <button class="d" onclick="purge()">Clear history</button>
+            <button onclick="doorProbe()">Try every unlock form</button>
+            <button onclick="loadDoor()">Refresh</button>
           </span>
         </h2>
-        <div class="body row">
-          <input id="fq" placeholder="Search anything" style="flex:1;min-width:140px" oninput="debounced()">
-          <input id="fpin" placeholder="PIN" style="width:90px" oninput="debounced()">
-          <input id="fname" placeholder="Name" style="width:140px" oninput="debounced()">
-          <select id="fdir" style="width:130px" onchange="refresh()">
-            <option value="">Type: all</option>
-            <option value="in">Check-in</option>
-            <option value="out">Check-out</option>
-            <option value="none">Unassigned</option>
-          </select>
-          <select id="fverify" style="width:160px" onchange="refresh()">
-            <option value="face">Verified by: Face</option>
-            <option value="">Verified by: all</option>
-          </select>
-          <input id="ffrom" type="date" style="width:150px" onchange="refresh()">
-          <input id="fto" type="date" style="width:150px" onchange="refresh()">
-          <button onclick="clearFilters()">Reset</button>
+        <div class="body note">
+          The protocol only ever tells us whether the terminal <b>accepted</b> the command.
+          If a form comes back <b>0</b> and the door still does not move, the command is fine
+          and the lock is not: check <b>Menu &rarr; Access Control &rarr; Door Lock Delay</b>
+          is above 0 on the terminal, and that the lock is wired to that terminal's relay
+          rather than to a separate access panel.
         </div>
-        <div class="scroll">
-          <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th></tr></thead>
-          <tbody id="tbLogs"></tbody></table>
-          <div class="empty" id="emptyLogs">Waiting for the first punch from the device...</div>
+        <div id="doorDev" class="body" style="border-top:1px solid var(--line)"></div>
+        <div class="scroll" style="max-height:320px">
+          <table><thead><tr><th>When</th><th>Terminal</th><th>Command</th><th>Collected</th><th>Reply</th></tr></thead>
+          <tbody id="tbDoor"></tbody></table>
+          <div class="empty" id="emptyDoor">No door command has been sent yet.</div>
         </div>
-      </div>
-
-      <div class="panel">
-        <h2>Users on device</h2>
-        <div class="scroll" style="max-height:260px">
-          <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
-          <tbody id="tbUsers"></tbody></table>
-          <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull users</b>.</div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h2>Protocol trace</h2>
-        <div class="log body" id="trace"></div>
       </div>
     </div>
 
+    <div>
+      <div class="panel">
+        <h2>Door access</h2>
+        <div class="body">
+          <div class="note" style="margin-bottom:10px">
+            <a href="/opendoor" target="_blank" style="color:var(--accent)">/opendoor</a> is a
+            full-screen button meant for a tablet at reception. Anyone who can reach this server
+            can press it, so set a code if that page is reachable from outside your network.
+          </div>
+          <div class="row">
+            <input id="doorPin" placeholder="door code (blank = no code)" style="flex:1;min-width:150px">
+            <button onclick="saveDoorPin()">Save code</button>
+          </div>
+          <div class="note" id="doorPinMsg" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- --------------------------------------------------------------- devices -->
+<section data-panel="dev" hidden>
+  <div class="cols">
     <div>
       <div class="panel">
         <h2>Device</h2>
         <div class="body" id="devBox"><div class="hint">No device has connected yet.</div></div>
       </div>
+      <div class="panel">
+        <h2>Protocol trace</h2>
+        <div class="log body" id="trace"></div>
+      </div>
+      <div class="panel">
+        <h2>Wire the device to this server</h2>
+        <div class="body hint" id="setup"></div>
+      </div>
+    </div>
 
+    <div>
       <div class="panel">
         <h2>Commands</h2>
         <div class="body">
-          <div id="doorMsg" class="note" style="margin-bottom:8px">
-            Opens every terminal that is online. Full-screen version:
-            <a href="/opendoor" target="_blank" style="color:var(--accent)">/opendoor</a>
-          </div>
           <div class="btns">
             <button class="p" onclick="openDoor()">Open door</button>
             <button onclick="cmd('synctime')">Sync clock</button>
@@ -1350,12 +1422,66 @@ td.num{font-variant-numeric:tabular-nums}
         <h2>Command queue</h2>
         <div class="log body" id="queue"></div>
       </div>
+    </div>
+  </div>
+</section>
 
-      <div class="panel">
-        <h2>Wire the device to this server</h2>
-        <div class="body hint" id="setup"></div>
+<!-- ---------------------------------------------------------------- server -->
+<section data-panel="srv" hidden>
+  <div class="panel">
+    <h2>Server
+      <span class="row"><button onclick="loadStats()">Refresh</button></span>
+    </h2>
+    <div id="statBox" class="body"><div class="hint">Loading...</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Attendance rules</h2>
+    <div class="body">
+      <div class="note" style="margin-bottom:10px">These apply everywhere &mdash; the dashboard,
+      the CSV exports and the HR API.</div>
+      <div class="row">
+        <label class="note"><input type="checkbox" id="setFace" style="width:auto;margin-right:6px"
+          onchange="saveRules()">Count face-verified punches only</label>
+        <label class="note">Fold repeat taps within
+          <input id="setDwell" type="number" min="0" max="60" style="width:70px;margin:0 6px"
+            onchange="saveRules()"> minutes into one movement</label>
+      </div>
+      <div class="note" id="ruleMsg" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>HR API</h2>
+    <div class="body">
+      <div class="note" style="margin-bottom:8px">
+        Read-only API for your HR system. Only the IP addresses listed here can call it &mdash;
+        an empty list blocks everyone. Your current IP is <b id="myIp">?</b>.
+      </div>
+      <div class="row">
+        <input id="ipList" placeholder="103.119.254.234, 49.37.0.0  (comma separated, * = any)" style="flex:1;min-width:240px">
+        <button class="p" onclick="saveIps()">Save allow-list</button>
+        <button onclick="useMyIp()">Use my IP</button>
+      </div>
+      <div id="ipMsg" class="note" style="margin-top:8px"></div>
+      <div class="note" style="margin-top:12px">
+        <b>Endpoints</b> &mdash; share these with HR:<br>
+        <span class="mono" id="hrUrls"></span>
       </div>
     </div>
+  </div>
+</section>
+
+</div>
+
+<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50" onclick="closeModal(event)">
+  <div style="max-width:560px;margin:6vh auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden" onclick="event.stopPropagation()">
+    <div style="padding:16px 18px;border-bottom:1px solid var(--line)">
+      <b id="mTitle"></b><div class="hint" id="mDate"></div>
+    </div>
+    <div style="padding:8px 18px;max-height:58vh;overflow:auto" id="mBody"></div>
+    <div style="padding:12px 18px;border-top:1px solid var(--line)">
+      <button style="width:100%" onclick="closeModal()">Done</button></div>
   </div>
 </div>
 
@@ -1405,7 +1531,33 @@ function fmtStamp(str){
   return { date: date, time: h12 + ':' + m[5] + ' ' + ap };
 }
 
-function boot(){ refresh(); loadStats(); loadIps(); setInterval(loadStats, 30000); }
+var TAB = 'att';
+function showTab(name){
+  TAB = name;
+  var tabs = document.querySelectorAll('.tab');
+  for (var i = 0; i < tabs.length; i++)
+    tabs[i].className = 'tab' + (tabs[i].dataset.tab === name ? ' on' : '');
+  var secs = document.querySelectorAll('section[data-panel]');
+  for (var j = 0; j < secs.length; j++) secs[j].hidden = secs[j].dataset.panel !== name;
+  try { localStorage.setItem('tab', name); } catch (e) {}
+  if (name === 'door') loadDoor();
+  if (name === 'srv') { loadStats(); loadIps(); }
+  refresh();
+}
+document.getElementById('tabs').addEventListener('click', function(e){
+  var b = e.target.closest('.tab');
+  if (b) showTab(b.dataset.tab);
+});
+
+function boot(){
+  var saved = 'att';
+  try { saved = localStorage.getItem('tab') || 'att'; } catch (e) {}
+  if (!document.querySelector('section[data-panel="' + saved + '"]')) saved = 'att';
+  showTab(saved);
+  loadIps();
+  setInterval(function(){ if (TAB === 'srv') loadStats(); }, 30000);
+  setInterval(function(){ if (TAB === 'door') loadDoor(); }, 5000);
+}
 
 function refresh(){
   fetch('/api/state?' + params().toString())
@@ -1544,37 +1696,107 @@ function toast(msg, cls){
   toastTimer = setTimeout(function(){ el.remove(); }, 6000);
 }
 
+function doorState(cls, msg){
+  var b = q('bigDoor');
+  if (b) b.className = 'door ' + (cls || '');
+  var m = q('doorMsg');
+  if (m) m.innerHTML = msg;
+  if (cls === 'ok' || cls === 'bad') setTimeout(function(){
+    if (q('bigDoor')) q('bigDoor').className = 'door';
+  }, 5000);
+}
+
 // The terminal collects commands on its next poll and answers separately, so
 // the button waits for that answer instead of claiming success immediately.
 function openDoor(){
   toast('Sending to the terminal&hellip;');
+  doorState('busy', 'Sending&hellip;');
   fetch('/api/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({kind:'unlock'})})
     .then(function(r){ return r.json(); })
     .then(function(j){
-      if (!j.ok) return toast(esc(j.error || 'failed'), 'bad');
+      if (!j.ok){ doorState('bad', esc(j.error || 'failed')); return toast(esc(j.error || 'failed'), 'bad'); }
       var ids = j.queued.map(function(c){ return c.id; });
-      toast('Queued for ' + j.targets.length + ' terminal(s), waiting for the door&hellip;');
+      var m = 'Queued for ' + j.targets.length + ' terminal(s), waiting for a reply&hellip;';
+      toast(m); doorState('busy', m);
       pollDoor(ids, Date.now() + 30000);
     })
-    .catch(function(){ toast('Server unreachable', 'bad'); });
+    .catch(function(){ doorState('bad', 'Server unreachable'); toast('Server unreachable', 'bad'); });
 }
 function pollDoor(ids, deadline){
   fetch('/api/cmd/status?ids=' + ids.join(','))
     .then(function(r){ return r.json(); })
     .then(function(j){
       var all = j.items.concat(j.followups);
-      if (all.some(function(c){ return c.ok === true; })) return toast('Door opened.', 'ok');
+      if (all.some(function(c){ return c.ok === true; })){
+        // all the protocol tells us is that the command was accepted
+        var m = 'Terminal accepted the unlock. If the door did not move, the lock is not '
+          + 'wired to this terminal or its Door Lock Delay is 0 &mdash; see Door diagnostics.';
+        doorState('ok', m);
+        return toast('Unlock accepted by the terminal.', 'ok');
+      }
       // a rejected wording spawns a retry; keep waiting while one is in flight
       var pending = !all.length || all.some(function(c){ return c.ok === null; });
-      if (!pending) return toast('The terminal refused every unlock command '
-        + '(last reply ' + esc(String(all[all.length-1] && all[all.length-1].result)) + '). '
-        + 'Check that the door relay is wired to this terminal.', 'bad');
-      if (Date.now() > deadline) return toast('No answer from the terminal in 30s &mdash; '
-        + 'it may be offline or still polling.', 'bad');
+      if (!pending){
+        var last = all[all.length-1];
+        var b = 'The terminal refused every unlock wording (last reply <b>'
+          + esc(String(last && last.result)) + '</b>). Run <b>Try every unlock form</b> below.';
+        doorState('bad', b);
+        return toast(b, 'bad');
+      }
+      if (Date.now() > deadline){
+        var t = 'No answer in 30s &mdash; the terminal is offline, or it connects but never '
+          + 'collects commands. Check Door diagnostics.';
+        doorState('bad', t);
+        return toast(t, 'bad');
+      }
       setTimeout(function(){ pollDoor(ids, deadline); }, 1000);
     })
-    .catch(function(){ toast('Server unreachable', 'bad'); });
+    .catch(function(){ doorState('bad', 'Server unreachable'); toast('Server unreachable', 'bad'); });
+}
+
+function loadDoor(){
+  fetch('/api/door/log').then(function(r){ return r.json(); }).then(function(j){
+    var on = j.devices.filter(function(d){ return d.online; });
+    q('doorDev').innerHTML = j.devices.map(function(d){
+      return '<div class="row" style="justify-content:space-between;padding:5px 0">'
+        + '<span class="mono">' + esc(d.sn) + '</span>'
+        + '<span class="row" style="gap:6px">'
+        + '<span class="tag">' + (d.lastCmd ? 'collects commands' : 'never collected a command') + '</span>'
+        + (d.unlockCmd ? '<span class="tag face">accepts ' + esc(d.unlockCmd.split(' ')[0]) + '</span>' : '')
+        + '<span class="badge ' + (d.online ? 'on' : 'off') + '">'
+        + (d.online ? 'online' : 'offline') + '</span></span></div>';
+    }).join('') || '<div class="note">No terminal has ever connected.</div>';
+    if (!on.length) q('doorDev').innerHTML += '<div class="note" style="margin-top:8px;color:var(--bad)">'
+      + 'Nothing is online, so no command can reach a door right now.</div>';
+
+    q('tbDoor').innerHTML = j.items.map(function(c){
+      var reply = c.returned
+        ? '<b style="color:' + (c.ok ? 'var(--ok)' : 'var(--bad)') + '">' + esc(String(c.result)) + '</b>'
+          + (c.ok ? ' accepted' : ' refused')
+        : (c.sent ? '<span style="color:var(--warn)">no reply yet</span>'
+                  : '<span style="color:var(--dim)">not collected</span>');
+      return '<tr><td class="mono">' + new Date(c.created).toLocaleTimeString() + '</td>'
+        + '<td class="mono" style="color:#8b949e">' + esc(c.sn.slice(-4)) + '</td>'
+        + '<td class="mono">' + esc(c.cmd) + (c.probe ? ' <span class="tag">test</span>' : '') + '</td>'
+        + '<td>' + (c.sent ? new Date(c.sent).toLocaleTimeString() : '&mdash;') + '</td>'
+        + '<td>' + reply + '</td></tr>';
+    }).join('');
+    q('emptyDoor').style.display = j.items.length ? 'none' : 'block';
+  }).catch(function(){});
+}
+
+function doorProbe(){
+  if (!confirm('Send every unlock wording to each online terminal once?\n\n'
+    + 'If one of them works the door will open during the test.')) return;
+  fetch('/api/door/probe', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok) return toast(esc(j.error || 'failed'), 'bad');
+      toast('Sent ' + j.queued.length + ' test command(s). Replies appear below within '
+        + 'a few seconds of each terminal polling.');
+      setTimeout(loadDoor, 1200);
+    });
 }
 
 function cmd(kind, extra, confirmMsg){
@@ -2111,7 +2333,7 @@ function poll(ids, deadline){
     .then(function(j){
       var all = j.items.concat(j.followups);
       if (all.some(function(c){ return c.ok === true; }))
-        return finish('ok', 'Door is open', 'Go ahead.');
+        return finish('ok', 'Unlocked', 'The terminal accepted it.');
       // a rejected wording queues the next one, so keep waiting while any is open
       if (all.length && !all.some(function(c){ return c.ok === null; })){
         var last = all[all.length - 1];
