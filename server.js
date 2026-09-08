@@ -21,6 +21,9 @@ const DATA_DIR = path.join(__dirname, 'data');
 const ATT_FILE = path.join(DATA_DIR, 'attlog.jsonl');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
+const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
+const ROLE_IN = snList(process.env.IN_SN);
+const ROLE_OUT = snList(process.env.OUT_SN);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -80,6 +83,7 @@ function touchDevice(sn, req) {
     d = state.devices[sn] = {
       sn, name: '', ip: '', firstSeen: Date.now(), lastSeen: 0,
       pushCount: 0, info: {}, stamp: '9999', opStamp: '9999', online: false,
+      role: ROLE_IN.includes(sn) ? 'in' : (ROLE_OUT.includes(sn) ? 'out' : ''),
     };
     trace('info', sn, 'new device registered');
   }
@@ -237,7 +241,8 @@ function parseOperlog(sn, body) {
 function parseOptions(sn, body) {
   const d = touchDevice(sn);
   if (!d) return;
-  for (const raw of body.split(/\r?\n/)) {
+  // firmware sends INFO as one comma-separated line: "MAC=..,UserCount=81,.."
+  for (const raw of body.split(/[\r\n,]+/)) {
     const line = raw.trim().replace(/^~/, '');
     if (!line) continue;
     const i = line.indexOf('=');
@@ -406,8 +411,19 @@ async function handleDevice(req, res, route, q) {
 
 /* ------------------------------------------------------------------- API */
 
+function dirOf(rec) {
+  if (rec.status === 0 || rec.status === 4 || rec.status === 3) return 'in';
+  if (rec.status === 1 || rec.status === 5 || rec.status === 2) return 'out';
+  const d = state.devices[rec.sn];
+  return (d && d.role) || '';
+}
+
 function filterLogs(q) {
   const term = (q.get('q') || '').toLowerCase();
+  const fPin = (q.get('pin') || '').trim().toLowerCase();
+  const fName = (q.get('name') || '').trim().toLowerCase();
+  const fDir = (q.get('dir') || '').trim();
+  const fVerify = (q.get('verify') || '').trim();
   const from = q.get('from');
   const to = q.get('to');
   const limit = Math.min(Number(q.get('limit') || 500), 20000);
@@ -424,7 +440,11 @@ function filterLogs(q) {
       (r.name || '').toLowerCase().includes(term) ||
       r.sn.toLowerCase().includes(term));
   }
-  return rows.slice(-limit).reverse();
+  if (fPin) rows = rows.filter((r) => r.pin.toLowerCase().includes(fPin));
+  if (fName) rows = rows.filter((r) => (r.name || '').toLowerCase().includes(fName));
+  if (fVerify) rows = rows.filter((r) => String(r.verify) === fVerify);
+  if (fDir) rows = rows.filter((r) => (dirOf(r) || 'none') === fDir);
+  return rows.slice(-limit).reverse().map((r) => Object.assign({ dir: dirOf(r) }, r));
 }
 
 async function handleApi(req, res, route, q) {
@@ -486,6 +506,15 @@ async function handleApi(req, res, route, q) {
     return jsonOut(res, { ok: true, cmd, queued: queued.map((c) => c.id) });
   }
 
+  if (route === '/api/role' && req.method === 'POST') {
+    const p = JSON.parse((await readBody(req)) || '{}');
+    const d = state.devices[p.sn];
+    if (!d) return jsonOut(res, { ok: false, error: 'unknown device' }, 404);
+    d.role = ['in', 'out'].includes(p.role) ? p.role : '';
+    saveSoon();
+    trace('info', p.sn, 'role set to ' + (d.role || 'unassigned'));
+    return jsonOut(res, { ok: true, role: d.role });
+  }
   if (route === '/api/purge' && req.method === 'POST') {
     state.logs.length = 0;
     seen.clear();
@@ -578,9 +607,21 @@ code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radi
           </span>
         </h2>
         <div class="body row">
-          <input id="fq" placeholder="Search PIN, name or serial" style="flex:1;min-width:180px" oninput="debounced()">
+          <input id="fq" placeholder="Search anything" style="flex:1;min-width:140px" oninput="debounced()">
+          <input id="fpin" placeholder="PIN" style="width:90px" oninput="debounced()">
+          <input id="fname" placeholder="Name" style="width:140px" oninput="debounced()">
+          <select id="fdir" style="width:130px" onchange="refresh()">
+            <option value="">Type: all</option>
+            <option value="in">Check-in</option>
+            <option value="out">Check-out</option>
+            <option value="none">Unassigned</option>
+          </select>
+          <select id="fverify" style="width:150px" onchange="refresh()">
+            <option value="">Verified by: all</option>
+          </select>
           <input id="ffrom" type="date" style="width:150px" onchange="refresh()">
           <input id="fto" type="date" style="width:150px" onchange="refresh()">
+          <button onclick="clearFilters()">Reset</button>
         </div>
         <div class="scroll">
           <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th></tr></thead>
@@ -679,12 +720,34 @@ function ago(ms){
 function params(){
   var p = new URLSearchParams();
   if (q('fq').value) p.set('q', q('fq').value);
+  if (q('fpin').value) p.set('pin', q('fpin').value);
+  if (q('fname').value) p.set('name', q('fname').value);
+  if (q('fdir').value) p.set('dir', q('fdir').value);
+  if (q('fverify').value) p.set('verify', q('fverify').value);
   if (q('ffrom').value) p.set('from', q('ffrom').value);
   if (q('fto').value) p.set('to', q('fto').value);
   p.set('limit','300');
   return p;
 }
 function debounced(){ clearTimeout(timer); timer = setTimeout(refresh, 250); }
+function clearFilters(){
+  ['fq','fpin','fname','fdir','fverify','ffrom','fto'].forEach(function(id){ q(id).value = ''; });
+  refresh();
+}
+var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
+var DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+// "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25 AM"}
+function fmtStamp(str){
+  var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(str || '');
+  if (!m) return { date: str || '', time: '' };
+  var dt = new Date(+m[1], +m[2] - 1, +m[3]);
+  var hh = +m[4], ap = hh < 12 ? 'AM' : 'PM';
+  var h12 = hh % 12; if (!h12) h12 = 12;
+  return {
+    date: m[3] + ' ' + MONTHS[+m[2] - 1] + ' (' + DAYS[dt.getDay()] + ')',
+    time: h12 + ':' + m[5] + ' ' + ap
+  };
+}
 
 function refresh(){
   fetch('/api/state?' + params().toString())
@@ -695,6 +758,13 @@ function refresh(){
 
 function render(s){
   LAB = s.labels;
+  var vsel = q('fverify');
+  if (vsel.options.length <= 1) {
+    Object.keys(LAB.verify || {}).forEach(function(k){
+      var o = document.createElement('option'); o.value = k; o.textContent = LAB.verify[k];
+      vsel.appendChild(o);
+    });
+  }
   q('cToday').textContent = s.totals.today;
   q('cTotal').textContent = s.totals.logs;
   q('cUsers').textContent = s.totals.users;
@@ -724,7 +794,14 @@ function render(s){
         + 'Users <b>' + esc(i.UserCount || i.user_count || '?') + '</b> &middot; '
         + 'Logs <b>' + esc(i.TransactionCount || i.transaction_count || '?') + '</b><br>'
         + 'Last contact <b>' + (d.lastSeen ? ago(d.lastSeen) : 'never') + '</b>'
-        + '</div></div>';
+        + '</div>'
+        + '<div class="row" style="margin-top:6px;align-items:center">'
+        + '<span class="hint">Gate role</span>'
+        + '<select onchange="setRole(\'' + esc(d.sn) + '\', this.value)">'
+        + '<option value=""' + (d.role ? '' : ' selected') + '>Unassigned</option>'
+        + '<option value="in"' + (d.role === 'in' ? ' selected' : '') + '>Check-in terminal</option>'
+        + '<option value="out"' + (d.role === 'out' ? ' selected' : '') + '>Check-out terminal</option>'
+        + '</select></div></div>';
     }).join('');
   }
 
@@ -732,9 +809,11 @@ function render(s){
   var tb = '';
   for (var i = 0; i < s.logs.length; i++) {
     var r = s.logs[i];
-    var st = LAB.status[r.status] || ('Status ' + r.status);
-    var cls = r.status === 1 || r.status === 5 ? 'out' : (r.status === 0 || r.status === 4 ? 'in' : '');
-    tb += '<tr><td class="mono">' + esc(r.time) + '</td>'
+    var st = r.dir === 'in' ? 'Check-in' : r.dir === 'out' ? 'Check-out'
+           : (LAB.status[r.status] || ('Status ' + r.status));
+    var cls = r.dir || '';
+    var f = fmtStamp(r.time);
+    tb += '<tr><td class="mono">' + esc(f.date) + ' <b>' + esc(f.time) + '</b></td>'
        + '<td class="mono">' + esc(r.pin) + '</td>'
        + '<td>' + (esc(r.name) || '<span style="color:#8b949e">&mdash;</span>') + '</td>'
        + '<td><span class="pill ' + cls + '">' + esc(st) + '</span></td>'
@@ -805,6 +884,10 @@ function delUser(){
 function purge(){
   if (!confirm('Delete all attendance history stored on this server? The device keeps its own copy.')) return;
   fetch('/api/purge', {method:'POST'}).then(refresh);
+}
+function setRole(sn, role){
+  fetch('/api/role', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ sn: sn, role: role }) }).then(refresh);
 }
 function exportCsv(){ window.location = '/api/export.csv?' + params().toString(); }
 
