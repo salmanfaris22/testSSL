@@ -198,9 +198,17 @@ function enqueue(sn, cmd, meta) {
 // handshake tells us which we are talking to, so we try them in order and
 // remember the one the terminal accepted - after the first success a device
 // only ever receives its own working form.
+// These are candidates, not a spec we can look up per device: the handshake
+// does not say which family this firmware belongs to, so we try each in turn
+// and keep the one the terminal answers Return=0 to. "Try every unlock form"
+// in the dashboard fires all of them and reports each reply, which is how you
+// find out whether the terminal accepts any of them at all.
+const UNLOCK_SEC = Number(process.env.UNLOCK_SEC) || 5;
 const UNLOCK_FORMS = [
   'AC_UNLOCK',
-  'CONTROL DEVICE 01 1 1 ' + (Number(process.env.UNLOCK_SEC) || 5) + ' 0',
+  'AC_UNLOCK 1',
+  'CONTROL DEVICE 01 1 1 ' + UNLOCK_SEC + ' 0',
+  'CONTROL DEVICE 01 000 0 0 0',
 ];
 
 function unlockCommand(sn, variant) {
@@ -489,6 +497,7 @@ async function handleDevice(req, res, route, q) {
         item.result = p.get('Return');
         trace('dev', sn, 'cmd ' + id + ' (' + item.cmd.split(' ')[0] + ') returned ' + item.result);
         if (item.kind === 'unlock') onUnlockReply(sn, item);
+        else if (item.kind === 'unlock-probe') item.ok = Number(item.result) === 0;
       } else {
         trace('dev', sn, 'devicecmd: ' + line.slice(0, 120));
       }
@@ -512,7 +521,10 @@ function onUnlockReply(sn, item) {
   if (ok) {
     item.ok = true;
     if (d && d.unlockCmd !== item.cmd) { d.unlockCmd = item.cmd; saveSoon(); }
-    trace('info', sn, 'door opened (' + item.cmd.split(' ')[0] + ')');
+    // Return=0 means the terminal accepted the command. Whether a lock
+    // actually moved depends on its relay wiring and lock delay, which the
+    // protocol never tells us.
+    trace('info', sn, 'unlock accepted (' + item.cmd.split(' ')[0] + ')');
     return;
   }
   item.ok = false;
@@ -833,6 +845,43 @@ async function handleApi(req, res, route, q) {
       online: devs.filter((d) => d.online).length,
       needsPin: !!state.settings.doorPin,
     });
+  }
+  // Everything known about door attempts, so "it does not work" can be read
+  // as an actual answer: was a terminal online, did it ever collect the
+  // command, and what did it reply.
+  if (route === '/api/door/log') {
+    const items = Object.values(state.queue).flat()
+      .filter((c) => c.kind === 'unlock' || c.kind === 'unlock-probe')
+      .sort((a, b) => b.created - a.created).slice(0, 30)
+      .map((c) => ({
+        id: c.id, sn: c.sn, cmd: c.cmd, probe: c.kind === 'unlock-probe',
+        created: c.created, sent: c.sent, returned: c.returned,
+        result: c.result, ok: c.ok === undefined ? null : c.ok,
+      }));
+    return jsonOut(res, {
+      forms: UNLOCK_FORMS,
+      devices: Object.values(state.devices).map((d) => ({
+        sn: d.sn, online: d.online, lastSeen: d.lastSeen,
+        // set only after a terminal answered Return=0 to one of the forms
+        unlockCmd: d.unlockCmd || '',
+        // a terminal that never picks commands up is the other failure mode
+        lastCmd: d.lastCmd || 0,
+      })),
+      items,
+    });
+  }
+  // Fires every candidate wording once at every online terminal and records
+  // each reply without chaining fallbacks. This is the test that says whether
+  // the terminal understands any unlock command at all.
+  if (route === '/api/door/probe' && req.method === 'POST') {
+    const online = Object.keys(state.devices).filter((sn) => state.devices[sn].online);
+    if (!online.length) return jsonOut(res, { ok: false, error: 'no terminal is online' }, 409);
+    const queued = [];
+    for (const sn of online) {
+      for (const form of UNLOCK_FORMS) queued.push(enqueue(sn, form, { kind: 'unlock-probe' }));
+    }
+    trace('info', '', 'door probe: ' + UNLOCK_FORMS.length + ' form(s) x ' + online.length + ' terminal(s)');
+    return jsonOut(res, { ok: true, targets: online, queued: queued.map((c) => c.id) });
   }
   if (route === '/api/opendoor' && req.method === 'POST') {
     let p = {};
