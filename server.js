@@ -21,6 +21,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 const ATT_FILE = path.join(DATA_DIR, 'attlog.jsonl');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
+const SET_FILE = path.join(DATA_DIR, 'settings.json');
 const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
 const ROLE_IN = snList(process.env.IN_SN);
 const ROLE_OUT = snList(process.env.OUT_SN);
@@ -35,6 +36,7 @@ const state = {
   logs: [],      // attendance punches
   queue: {},     // sn -> pending command objects
   events: [],    // raw protocol trace
+  settings: { allowIps: [] },   // HR API allow-list; empty = denied
 };
 const seen = new Set();          // dedupe key for punches
 let cmdSeq = Date.now() % 100000;
@@ -49,9 +51,24 @@ function loadState() {
     }
   } catch (e) { /* first run */ }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
+  try { Object.assign(state.settings, JSON.parse(fs.readFileSync(SET_FILE, 'utf8'))); } catch (e) {}
   try {
     state.devices = JSON.parse(fs.readFileSync(DEV_FILE, 'utf8'));
-    for (const sn of Object.keys(state.devices)) state.devices[sn].online = false;
+    for (const sn of Object.keys(state.devices)) {
+      const d = state.devices[sn];
+      d.online = false;
+      // the old parser stuffed the whole comma-separated INFO line into one
+      // key; re-split it so Firmware / Faces / Users / Logs resolve
+      for (const [k, v] of Object.entries(d.info || {})) {
+        if (typeof v === 'string' && v.includes('=') && v.includes(',')) {
+          delete d.info[k];
+          for (const part of (k + '=' + v).split(',')) {
+            const i = part.indexOf('=');
+            if (i > 0) d.info[part.slice(0, i).trim().replace(/^~/, '')] = part.slice(i + 1).trim();
+          }
+        }
+      }
+    }
   } catch (e) {}
 }
 
@@ -63,6 +80,7 @@ function saveSoon() {
     try {
       fs.writeFileSync(USERS_FILE, JSON.stringify(state.users, null, 2));
       fs.writeFileSync(DEV_FILE, JSON.stringify(state.devices, null, 2));
+      fs.writeFileSync(SET_FILE, JSON.stringify(state.settings, null, 2));
     } catch (e) { console.error('save failed', e.message); }
   }, 800);
 }
@@ -466,25 +484,37 @@ function dayEvents(pin, date) {
 function daySummary(pin, date) {
   const evs = dayEvents(pin, date);
   const inEv = evs.find((e) => e.label === 'Check in');
-  const outEv = evs.slice().reverse().find((e) => e.label === 'Check out');
+  const outEv = evs.find((e) => e.label === 'Check out');
 
+  // A break is a Break start -> Break end pair strictly inside the working
+  // window. Anything outside it (a stray gate tap before arrival or after
+  // leaving) is not a break - that is what produced 17h breaks on a 6h day.
+  const core = evs.filter((e) => !e.repeat);
+  const iIn = core.indexOf(inEv);
+  const iOut = core.indexOf(outEv);
   let breakMin = 0;
-  for (let i = 0; i < evs.length; i++) {
-    if (evs[i].label !== 'Break start') continue;
-    const end = evs.slice(i + 1).find((e) => e.label === 'Break end' || e.label === 'Check out');
-    if (end && end.label === 'Break end') {
-      breakMin += Math.round((tsOf(end.time) - tsOf(evs[i].time)) / 60000);
+  const breaks = [];
+  if (iIn > -1 && iOut > iIn) {
+    for (let i = iIn + 1; i < iOut; i++) {
+      if (core[i].label !== 'Break start') continue;
+      const nxt = core[i + 1];
+      if (!nxt || nxt.label !== 'Break end') continue;
+      const min = Math.round((tsOf(nxt.time) - tsOf(core[i].time)) / 60000);
+      if (min <= 0) continue;
+      breaks.push({ from: core[i].time, to: nxt.time, min });
+      breakMin += min;
     }
   }
   const totalMin = inEv && outEv ? Math.round((tsOf(outEv.time) - tsOf(inEv.time)) / 60000) : 0;
+  breakMin = Math.min(breakMin, totalMin);
   const dow = new Date(date + 'T00:00:00').getDay();
   return {
     date, dow,
     status: evs.length ? 'Present' : (dow === 0 ? 'Weekly off' : 'Absent'),
     in: inEv ? inEv.time : '', out: outEv ? outEv.time : '',
     incomplete: !!(evs.length && (!inEv || !outEv)),
-    punches: evs.length, breakMin, totalMin,
-    effectiveMin: Math.max(0, totalMin - breakMin),
+    punches: evs.length, breakMin, totalMin, breaks,
+    workMin: Math.max(0, totalMin - breakMin),
     events: evs,
   };
 }
@@ -517,7 +547,7 @@ function attendance(pin, from, to) {
       sundays: days.filter((d) => d.dow === 0).length,
       totalMin: sum('totalMin'),
       breakMin: sum('breakMin'),
-      effectiveMin: sum('effectiveMin'),
+      workMin: sum('workMin'),
     },
   };
 }
@@ -548,10 +578,111 @@ function filterLogs(q) {
   if (fName) rows = rows.filter((r) => (r.name || '').toLowerCase().includes(fName));
   if (fVerify) rows = rows.filter((r) => String(r.verify) === fVerify);
   if (fDir) rows = rows.filter((r) => (dirOf(r) || 'none') === fDir);
-  return rows.slice(-limit).reverse().map((r) => Object.assign({ dir: dirOf(r) }, r));
+  return rows.slice()
+    .sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0))
+    .slice(0, limit)
+    .map((r) => Object.assign({ dir: dirOf(r) }, r));
+}
+
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return (fwd || req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+}
+
+// HR integration is allow-list only, and denied while the list is empty.
+function ipAllowed(req) {
+  const list = state.settings.allowIps || [];
+  if (!list.length) return false;
+  const ip = clientIp(req);
+  return list.some((a) => a === '*' || a === ip);
+}
+
+function dirSize(dir) {
+  const files = [];
+  let total = 0;
+  for (const f of fs.readdirSync(dir)) {
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.isFile()) { files.push({ name: f, bytes: st.size }); total += st.size; }
+    } catch (e) { /* ignore */ }
+  }
+  return { total, files: files.sort((a, b) => b.bytes - a.bytes) };
+}
+
+function serverStats() {
+  const store = dirSize(DATA_DIR);
+  const byDay = {};
+  for (const r of state.logs) byDay[r.time.slice(0, 10)] = (byDay[r.time.slice(0, 10)] || 0) + 1;
+  const series = [];
+  const d = new Date();
+  d.setDate(d.getDate() - 13);
+  for (let i = 0; i < 14; i++) {
+    const key = localDate(d);
+    series.push({ date: key, count: byDay[key] || 0 });
+    d.setDate(d.getDate() + 1);
+  }
+  const mem = process.memoryUsage();
+  return {
+    store,
+    counts: {
+      logs: state.logs.length,
+      users: Object.keys(state.users).length,
+      devices: Object.keys(state.devices).length,
+      online: Object.values(state.devices).filter((x) => x.online).length,
+    },
+    series,
+    proc: {
+      uptime: Math.round(process.uptime()),
+      rss: mem.rss, heapUsed: mem.heapUsed,
+      node: process.version, pid: process.pid, port: PORT,
+    },
+    host: {
+      load: os.loadavg().map((x) => Math.round(x * 100) / 100),
+      cpus: os.cpus().length,
+      totalMem: os.totalmem(), freeMem: os.freemem(),
+      platform: os.platform(), hostname: os.hostname(),
+    },
+  };
 }
 
 async function handleApi(req, res, route, q) {
+  // ---- HR read-only API, restricted to allow-listed IPs
+  if (route.startsWith('/api/hr/')) {
+    if (!ipAllowed(req)) {
+      trace('err', '', 'HR API denied for ' + clientIp(req));
+      return jsonOut(res, { error: 'forbidden', ip: clientIp(req) }, 403);
+    }
+    const today = localDate(new Date());
+    const to = q.get('to') || today;
+    const from = q.get('from') || to;
+    if (route === '/api/hr/users') {
+      return jsonOut(res, { users: Object.values(state.users) });
+    }
+    if (route === '/api/hr/punches') {
+      return jsonOut(res, { from, to, punches: filterLogs(q) });
+    }
+    if (route === '/api/hr/attendance') {
+      const pin = q.get('pin');
+      if (pin) return jsonOut(res, attendance(pin, from, to));
+      const rows = Object.keys(state.users)
+        .map((x) => attendance(x, from, to))
+        .sort((a, b) => Number(a.pin) - Number(b.pin));
+      return jsonOut(res, { from, to, employees: rows });
+    }
+    return jsonOut(res, { error: 'unknown endpoint' }, 404);
+  }
+  if (route === '/api/stats') return jsonOut(res, serverStats());
+  if (route === '/api/settings' && req.method === 'GET') {
+    return jsonOut(res, { allowIps: state.settings.allowIps || [], yourIp: clientIp(req) });
+  }
+  if (route === '/api/settings' && req.method === 'POST') {
+    const body = JSON.parse((await readBody(req)) || '{}');
+    state.settings.allowIps = (body.allowIps || [])
+      .map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
+    saveSoon();
+    trace('info', '', 'HR allow-list set to ' + (state.settings.allowIps.join(' ') || '(empty)'));
+    return jsonOut(res, { ok: true, allowIps: state.settings.allowIps });
+  }
   if (route === '/health' || route === '/api/health') {
     return jsonOut(res, { status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
   }
@@ -693,6 +824,17 @@ padding:7px 10px;font-size:13px;font-family:inherit;width:100%}
 .log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .log .dev{color:#7ee787}.log .srv{color:#79c0ff}.log .err{color:#f87171}.log .info{color:var(--dim)}
 .hint{color:var(--dim);font-size:12px;line-height:1.7}
+.scroll table{min-width:640px}
+.grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+@media(max-width:820px){
+  .cols{grid-template-columns:1fr}
+  .grid{grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+  .card{padding:10px 12px}.card .v{font-size:20px}
+  h2{flex-wrap:wrap;gap:6px}
+  .body.row>*{flex:1 1 auto;min-width:0}
+  input,select{width:100%}
+  #aList{position:fixed;left:12px;right:12px;top:auto}
+}
 .hint b{color:var(--fg)}
 code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radius:5px;font-size:12px}
 .empty{padding:34px;text-align:center;color:var(--dim)}
@@ -717,14 +859,21 @@ code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radi
       <span class="row"><button onclick="attCsv()">Download CSV</button></span>
     </h2>
     <div class="body row">
-      <select id="aUser" style="min-width:220px" onchange="loadAtt()"><option value="">Select an employee...</option></select>
+      <div style="position:relative;min-width:250px">
+        <input id="aSearch" placeholder="Search employee by name or PIN..." autocomplete="off"
+               oninput="pickFilter()" onfocus="pickOpen()">
+        <div id="aList" style="display:none;position:absolute;z-index:30;left:0;right:0;top:38px;
+             max-height:280px;overflow:auto;background:var(--panel);border:1px solid var(--line);
+             border-radius:8px;box-shadow:0 12px 32px rgba(0,0,0,.5)"></div>
+      </div>
+      <input type="hidden" id="aUser">
       <input id="aFrom" type="date" style="width:150px" onchange="loadAtt()">
       <input id="aTo" type="date" style="width:150px" onchange="loadAtt()">
     </div>
     <div id="aKpis"></div>
     <div class="scroll">
       <table><thead><tr><th>Date</th><th>Status</th><th>Check-in &ndash; Check-out</th>
-      <th>Total hours</th><th>Break</th><th>Effective hours</th><th>Punches</th></tr></thead>
+      <th>Total hours</th><th>Break</th><th>Punches</th></tr></thead>
       <tbody id="tbAtt"></tbody></table>
       <div class="empty" id="emptyAtt">Pick an employee to see their daily log.</div>
     </div>
@@ -738,6 +887,29 @@ code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radi
       <div style="padding:8px 18px;max-height:58vh;overflow:auto" id="mBody"></div>
       <div style="padding:12px 18px;border-top:1px solid var(--line)">
         <button style="width:100%" onclick="closeModal()">Done</button></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:16px">
+    <h2>Server &amp; HR API
+      <span class="row"><button onclick="loadStats()">Refresh</button></span>
+    </h2>
+    <div id="statBox" class="body"><div class="hint">Loading...</div></div>
+    <div class="body" style="border-top:1px solid var(--line)">
+      <div class="hint" style="margin-bottom:8px">
+        Read-only API for your HR system. Only the IP addresses listed here can call it &mdash;
+        an empty list blocks everyone. Your current IP is <b id="myIp">?</b>.
+      </div>
+      <div class="row">
+        <input id="ipList" placeholder="103.119.254.234, 49.37.0.0  (comma separated, * = any)" style="flex:1;min-width:240px">
+        <button class="p" onclick="saveIps()">Save allow-list</button>
+        <button onclick="useMyIp()">Use my IP</button>
+      </div>
+      <div id="ipMsg" class="hint" style="margin-top:8px"></div>
+      <div class="hint" style="margin-top:10px">
+        <b>Endpoints</b> &mdash; share these with HR:<br>
+        <span class="mono" id="hrUrls"></span>
+      </div>
     </div>
   </div>
 
@@ -882,16 +1054,17 @@ var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov'
 var DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 // "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25 AM"}
 function fmtStamp(str){
-  var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(str || '');
+  var m = /^([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[ T]([0-9]{2}):([0-9]{2}))?/.exec(str || '');
   if (!m) return { date: str || '', time: '' };
   var dt = new Date(+m[1], +m[2] - 1, +m[3]);
+  var date = m[3] + ' ' + MONTHS[+m[2] - 1] + ' (' + DAYS[dt.getDay()] + ')';
+  if (m[4] === undefined) return { date: date, time: '' };
   var hh = +m[4], ap = hh < 12 ? 'AM' : 'PM';
   var h12 = hh % 12; if (!h12) h12 = 12;
-  return {
-    date: m[3] + ' ' + MONTHS[+m[2] - 1] + ' (' + DAYS[dt.getDay()] + ')',
-    time: h12 + ':' + m[5] + ' ' + ap
-  };
+  return { date: date, time: h12 + ':' + m[5] + ' ' + ap };
 }
+
+function boot(){ refresh(); loadStats(); loadIps(); setInterval(loadStats, 30000); }
 
 function refresh(){
   fetch('/api/state?' + params().toString())
@@ -932,7 +1105,9 @@ function render(s){
         + '<span class="badge ' + (d.online?'on':'off') + '">' + (d.online?'online':'offline') + '</span></div>'
         + '<div class="hint" style="margin-top:6px">'
         + 'IP <b>' + esc(d.ip||'?') + '</b><br>'
-        + 'Model <b>' + esc(i.DeviceName || i['~DeviceName'] || 'AIFACE-MARS') + '</b><br>'
+        + 'Model <b>' + esc((i.DeviceName || i['~DeviceName'] || 'AIFACE-MARS').split(',')[0]) + '</b>'
+        + ' <span class="hint">' + esc(i.Platform || '') + '</span><br>'
+        + 'LAN IP <b>' + esc(i.IPAddress || '?') + '</b> &middot; MAC <b>' + esc(i.MAC || '?') + '</b><br>'
         + 'Firmware <b>' + esc(i.FWVersion || i['~ZKFPVersion'] || '?') + '</b><br>'
         + 'Faces <b>' + esc(i.FaceCount || i.face_count || '?') + '</b> &middot; '
         + 'Users <b>' + esc(i.UserCount || i.user_count || '?') + '</b> &middot; '
@@ -967,17 +1142,7 @@ function render(s){
   q('tbLogs').innerHTML = tb;
   q('emptyLogs').style.display = s.logs.length ? 'none' : 'block';
 
-  var sel = q('aUser');
-  if (sel.options.length - 1 !== s.users.length){
-    var keep = sel.value;
-    sel.innerHTML = '<option value="">Select an employee...</option>';
-    s.users.forEach(function(u){
-      var o = document.createElement('option');
-      o.value = u.pin; o.textContent = (u.name || '(no name)') + '  -  PIN ' + u.pin;
-      sel.appendChild(o);
-    });
-    sel.value = keep;
-  }
+  PEOPLE = s.users;
   if (!q('aTo').value){
     var now = new Date(), pad = function(x){ return String(x).padStart(2,'0'); };
     var iso = function(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); };
@@ -1051,8 +1216,43 @@ function setRole(sn, role){
   fetch('/api/role', { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ sn: sn, role: role }) }).then(refresh);
 }
-var ATT = null;
+var ATT = null, PEOPLE = [];
 function hm(m){ return (m/60|0) + 'h ' + (m%60) + 'm'; }
+function bytes(b){
+  var u = ['B','KB','MB','GB'], i = 0;
+  while (b >= 1024 && i < u.length-1){ b /= 1024; i++; }
+  return (i ? b.toFixed(1) : b) + ' ' + u[i];
+}
+
+function pickOpen(){ pickFilter(); q('aList').style.display = 'block'; }
+function pickFilter(){
+  var t = q('aSearch').value.toLowerCase();
+  var hits = PEOPLE.filter(function(u){
+    return !t || (u.name||'').toLowerCase().indexOf(t) > -1 || String(u.pin).indexOf(t) > -1;
+  }).slice(0, 60);
+  q('aList').innerHTML = hits.length ? hits.map(function(u){
+    return '<div class="opt" data-pin="' + esc(u.pin) + '" data-name="' + esc(u.name||'') + '"'
+      + ' style="padding:9px 12px;cursor:pointer;border-bottom:1px solid #1c222b">'
+      + '<b>' + (esc(u.name) || '(no name)') + '</b>'
+      + ' <span class="hint">PIN ' + esc(u.pin) + '</span></div>';
+  }).join('') : '<div class="hint" style="padding:10px 12px">No match</div>';
+  q('aList').style.display = 'block';
+}
+function pickChoose(pin, name){
+  q('aUser').value = pin;
+  q('aSearch').value = name ? name + '  -  PIN ' + pin : 'PIN ' + pin;
+  q('aList').style.display = 'none';
+  loadAtt();
+}
+document.addEventListener('click', function(e){
+  if (e.target.closest && e.target.closest('.opt')){
+    var o = e.target.closest('.opt');
+    return pickChoose(o.dataset.pin, o.dataset.name);
+  }
+  if (!e.target.closest || !e.target.closest('#aList,#aSearch')) {
+    var l = q('aList'); if (l) l.style.display = 'none';
+  }
+});
 
 function loadAtt(){
   var pin = q('aUser').value;
@@ -1068,23 +1268,25 @@ function renderAtt(a){
   q('aKpis').innerHTML = '<div class="grid">'
     + kpi('Total days', t.totalDays) + kpi('Present', t.present, 'var(--ok)')
     + kpi('Absent', t.absent, t.absent ? 'var(--bad)' : '') + kpi('Sundays', t.sundays)
-    + kpi('Total hours', hm(t.totalMin)) + kpi('Break', hm(t.breakMin), 'var(--warn)')
-    + kpi('Effective hours', hm(t.effectiveMin), 'var(--ok)') + '</div>';
+    + kpi('Total hours', hm(t.totalMin)) + kpi('Break', hm(t.breakMin), 'var(--warn)') + '</div>';
 
   var tb = '';
   for (var i = 0; i < a.days.length; i++){
     var d = a.days[i];
-    var f = fmtStamp(d.date + ' 00:00');
+    var f = fmtStamp(d.date);
     var col = d.status === 'Present' ? 'var(--ok)' : d.status === 'Absent' ? 'var(--bad)' : 'var(--dim)';
-    var span = d.in && d.out ? fmtStamp(d.in).time + ' - ' + fmtStamp(d.out).time
-             : d.in ? fmtStamp(d.in).time + ' - <span style="color:var(--warn)">no check-out</span>'
+    var span = d.in && d.out ? fmtStamp(d.in).time + ' &ndash; ' + fmtStamp(d.out).time
+             : d.in ? fmtStamp(d.in).time + ' &ndash; <span style="color:var(--warn)">no check-out</span>'
+             : d.out ? '<span style="color:var(--warn)">no check-in</span> &ndash; ' + fmtStamp(d.out).time
              : '<span style="color:#8b949e">Not marked</span>';
     tb += '<tr style="cursor:pointer" onclick="openDay(' + i + ')">'
        + '<td>' + esc(f.date) + '</td>'
        + '<td style="color:' + col + '">' + esc(d.status) + '</td>'
-       + '<td class="mono">' + span + '</td>'
-       + '<td>' + hm(d.totalMin) + '</td><td>' + hm(d.breakMin) + '</td>'
-       + '<td><b>' + hm(d.effectiveMin) + '</b></td>'
+       + '<td>' + span + '</td>'
+       + '<td><b>' + hm(d.totalMin) + '</b></td>'
+       + '<td' + (d.breakMin ? ' style="color:var(--warn)"' : '') + '>' + hm(d.breakMin)
+       + (d.breaks && d.breaks.length > 1 ? ' <span class="hint">(' + d.breaks.length + ')</span>' : '')
+       + '</td>'
        + '<td class="mono" style="color:#8b949e">' + d.punches + '</td></tr>';
   }
   q('tbAtt').innerHTML = tb;
@@ -1100,7 +1302,8 @@ var DOT = {'Check in':'var(--ok)','Check out':'var(--warn)','Break start':'var(-
 function openDay(i){
   var d = ATT.days[i];
   q('mTitle').textContent = ATT.name || ('PIN ' + ATT.pin);
-  q('mDate').textContent = d.date + '  -  ' + hm(d.effectiveMin) + ' effective';
+  var df = fmtStamp(d.date);
+  q('mDate').textContent = df.date + '  -  ' + hm(d.totalMin) + ' total, ' + hm(d.breakMin) + ' break';
   if (!d.events.length){ q('mBody').innerHTML = '<div class="empty">No punches on this day.</div>'; }
   else {
     q('mBody').innerHTML = d.events.map(function(e){
@@ -1122,10 +1325,10 @@ document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeM
 
 function attCsv(){
   if (!ATT) return;
-  var rows = [['Date','Status','Check in','Check out','Total','Break','Effective','Punches']];
+  var rows = [['Date','Status','Check in','Check out','Total','Break','Punches']];
   ATT.days.forEach(function(d){
     rows.push([d.date, d.status, fmtStamp(d.in).time, fmtStamp(d.out).time,
-               hm(d.totalMin), hm(d.breakMin), hm(d.effectiveMin), d.punches]);
+               hm(d.totalMin), hm(d.breakMin), d.punches]);
   });
   var csv = rows.map(function(r){ return r.join(','); }).join(String.fromCharCode(10));
   var a = document.createElement('a');
@@ -1134,9 +1337,75 @@ function attCsv(){
   a.click();
 }
 
+function spark(series){
+  var max = Math.max.apply(null, series.map(function(p){ return p.count; }).concat([1]));
+  var w = 13, gap = 4, h = 44;
+  return '<svg width="' + (series.length*(w+gap)) + '" height="' + (h+18) + '">'
+    + series.map(function(p, i){
+        var bh = Math.max(2, Math.round(p.count / max * h));
+        return '<rect x="' + (i*(w+gap)) + '" y="' + (h-bh) + '" width="' + w + '" height="' + bh
+          + '" rx="2" fill="' + (p.count ? '#2f81f7' : '#30363d') + '"><title>' + p.date + ': '
+          + p.count + ' punches</title></rect>'
+          + '<text x="' + (i*(w+gap)+w/2) + '" y="' + (h+13) + '" font-size="9" fill="#8b949e"'
+          + ' text-anchor="middle">' + p.date.slice(8) + '</text>';
+      }).join('')
+    + '</svg>';
+}
+
+function loadStats(){
+  fetch('/api/stats').then(function(r){ return r.json(); }).then(function(t){
+    var memPct = Math.round((1 - t.host.freeMem/t.host.totalMem) * 100);
+    q('statBox').innerHTML = '<div class="grid">'
+      + kpi('Stored data', bytes(t.store.total))
+      + kpi('Punches', t.counts.logs)
+      + kpi('Employees', t.counts.users)
+      + kpi('Devices online', t.counts.online + ' / ' + t.counts.devices,
+            t.counts.online ? 'var(--ok)' : 'var(--bad)')
+      + kpi('Server uptime', hm(Math.round(t.proc.uptime/60)))
+      + kpi('Process memory', bytes(t.proc.rss))
+      + kpi('Host memory', memPct + '%', memPct > 85 ? 'var(--warn)' : '')
+      + kpi('Load (1m)', t.host.load[0], t.host.load[0] > t.host.cpus ? 'var(--warn)' : '')
+      + '</div>'
+      + '<div class="hint" style="margin-bottom:6px">Punches per day (last 14 days)</div>'
+      + '<div style="overflow-x:auto">' + spark(t.series) + '</div>'
+      + '<div class="hint" style="margin-top:12px">Files in ./data &mdash; '
+      + t.store.files.map(function(f){ return esc(f.name) + ' <b>' + bytes(f.bytes) + '</b>'; }).join(' &middot; ')
+      + '</div>'
+      + '<div class="hint" style="margin-top:6px">Node ' + esc(t.proc.node) + ' &middot; '
+      + esc(t.host.platform) + ' &middot; ' + t.host.cpus + ' CPU &middot; port ' + t.proc.port + '</div>';
+  });
+}
+
+function loadIps(){
+  fetch('/api/settings').then(function(r){ return r.json(); }).then(function(c){
+    q('ipList').value = (c.allowIps || []).join(', ');
+    q('myIp').textContent = c.yourIp || '?';
+    var base = location.origin;
+    q('hrUrls').innerHTML = [
+      base + '/api/hr/attendance?from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/attendance?pin=2&from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/punches?from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/users'
+    ].map(esc).join('<br>');
+    q('ipMsg').innerHTML = (c.allowIps || []).length
+      ? '<span style="color:var(--ok)">Allow-list active for ' + c.allowIps.length + ' address(es).</span>'
+      : '<span style="color:var(--bad)">Empty list &mdash; the HR API is blocked for everyone.</span>';
+  });
+}
+function useMyIp(){
+  var cur = q('ipList').value.trim();
+  var mine = q('myIp').textContent;
+  q('ipList').value = cur ? cur + ', ' + mine : mine;
+}
+function saveIps(){
+  var list = q('ipList').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+  fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ allowIps: list }) }).then(loadIps);
+}
+
 function exportCsv(){ window.location = '/api/export.csv?' + params().toString(); }
 
-refresh();
+boot();
 setInterval(refresh, 3000);
 </script>
 </body></html>`;
