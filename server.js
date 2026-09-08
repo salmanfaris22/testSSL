@@ -28,6 +28,21 @@ const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
 const SET_FILE = path.join(DATA_DIR, 'settings.json');
 const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
+// The terminals report punches in UTC: a punch received at 11:34:10 server
+// time carries the stamp 06:04:09. Shift on ingest so everything downstream
+// (day grouping, filters, exports) works in Indian time. Set to 0 if you
+// reconfigure the terminals to local time.
+const DEVICE_OFFSET_MIN = Number(
+  process.env.DEVICE_OFFSET_MIN === undefined ? 330 : process.env.DEVICE_OFFSET_MIN);
+
+function shiftStamp(t, mins) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(t || '');
+  if (!m || !mins) return t;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+  d.setUTCMinutes(d.getUTCMinutes() + mins);
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
 const ROLE_IN = snList(process.env.IN_SN);
 const ROLE_OUT = snList(process.env.OUT_SN);
 
@@ -47,14 +62,24 @@ const seen = new Set();          // dedupe key for punches
 let cmdSeq = Date.now() % 100000;
 
 function loadState() {
+  let migrated = 0;
   try {
     for (const line of fs.readFileSync(ATT_FILE, 'utf8').split('\n')) {
       if (!line.trim()) continue;
       const r = JSON.parse(line);
+      if (r.devTime === undefined) { r.devTime = r.time; r.time = shiftStamp(r.time, DEVICE_OFFSET_MIN); migrated++; }
       state.logs.push(r);
       seen.add(r.sn + '|' + r.pin + '|' + r.time + '|' + r.status);
     }
   } catch (e) { /* first run */ }
+  if (migrated) {
+    try {
+      fs.copyFileSync(ATT_FILE, ATT_FILE + '.pre-tz-backup');
+      fs.writeFileSync(ATT_FILE, state.logs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+      console.log('  Shifted ' + migrated + ' stored punches by ' + DEVICE_OFFSET_MIN
+        + ' min into local time (backup: attlog.jsonl.pre-tz-backup)');
+    } catch (e) { console.error('  tz migration write failed: ' + e.message); }
+  }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
   try { Object.assign(state.settings, JSON.parse(fs.readFileSync(SET_FILE, 'utf8'))); } catch (e) {}
   try {
@@ -188,12 +213,13 @@ const STATUS = {
   4: 'OT-In', 5: 'OT-Out', 255: 'Punch',
 };
 
-function addPunch(sn, pin, time, status, verify, workcode, extra) {
+function addPunch(sn, pin, devTime, status, verify, workcode, extra) {
+  const time = shiftStamp(devTime, DEVICE_OFFSET_MIN);
   const key = sn + '|' + pin + '|' + time + '|' + status;
   if (seen.has(key)) return false;
   seen.add(key);
   const rec = {
-    sn, pin: String(pin), time, status: Number(status) || 0,
+    sn, pin: String(pin), time, devTime, status: Number(status) || 0,
     verify: Number(verify) || 0, workcode: workcode || '0',
     name: (state.users[pin] && state.users[pin].name) || '',
     recv: Date.now(), extra: extra || '',
