@@ -323,7 +323,7 @@ function lanIPs() {
 
 function handshake(sn) {
   const d = touchDevice(sn);
-  const off = -new Date().getTimezoneOffset() / 60;
+  const off = 5.5;
   return [
     'GET OPTION FROM: ' + sn,
     'ATTLOGStamp=' + (d ? d.stamp : '9999'),
