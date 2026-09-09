@@ -206,7 +206,9 @@ function trace(kind, sn, msg) {
   state.events.push({ t: Date.now(), kind, sn: sn || '-', msg: String(msg).slice(0, 400) });
   if (state.events.length > 400) state.events.splice(0, state.events.length - 400);
   const tag = kind === 'err' ? '!!' : kind === 'dev' ? '<<' : kind === 'srv' ? '>>' : '..';
-  console.log(new Date().toLocaleTimeString(), tag, (sn || '-'), String(msg).slice(0, 200));
+  const n = new Date(), p2 = (x) => String(x).padStart(2, '0');
+  console.log(p2(n.getHours()) + ':' + p2(n.getMinutes()) + ':' + p2(n.getSeconds()),
+    tag, (sn || '-'), String(msg).slice(0, 200));
 }
 
 /* ----------------------------------------------------------- device model */
@@ -507,23 +509,30 @@ function handshake(sn) {
 
 async function handleDevice(req, res, route, q) {
   const sn = q.get('SN') || q.get('sn') || '';
+  // Half of a protocol problem is what we answered, and the trace used to show
+  // only the terminal's side of it. Every reply goes through here now.
+  const reply = (body) => {
+    trace('rep', sn, route.replace('/iclock/', '') + ' -> '
+      + String(body).replace(/\r?\n/g, ' | ').trim());
+    return textOut(res, body);
+  };
 
-  if (route === '/iclock/ping') { touchDevice(sn, req); return textOut(res, 'OK'); }
+  if (route === '/iclock/ping') { touchDevice(sn, req); return reply('OK'); }
 
   if (route === '/iclock/registry') {
     await readBody(req);
     trace('dev', sn, 'registry request');
-    return textOut(res, 'RegistryCode=' + (sn || 'AIFACE') + '\n');
+    return reply('RegistryCode=' + (sn || 'AIFACE') + '\n');
   }
   if (route === '/iclock/push') {
     touchDevice(sn, req);
-    return textOut(res, 'RegistryCode=' + sn + '\nServerVersion=2.4.1\n');
+    return reply('RegistryCode=' + sn + '\nServerVersion=2.4.1\n');
   }
 
   if (route === '/iclock/cdata' && req.method === 'GET') {
     touchDevice(sn, req);
     trace('dev', sn, 'handshake: ' + req.url);
-    return textOut(res, handshake(sn));
+    return reply(handshake(sn));
   }
 
   if (route === '/iclock/cdata' && req.method === 'POST') {
@@ -534,29 +543,29 @@ async function handleDevice(req, res, route, q) {
     if (table === 'ATTLOG') {
       if (stamp && d) d.stamp = stamp;
       const n = parseAttlog(sn, body);
-      return textOut(res, 'OK: ' + n);
+      return reply('OK: ' + n);
     }
     if (table === 'OPERLOG' || table === 'USERINFO' || table === 'BIODATA') {
       if (stamp && d) d.opStamp = stamp;
       const n = parseOperlog(sn, body);
-      return textOut(res, 'OK: ' + n);
+      return reply('OK: ' + n);
     }
     if (table === 'OPTIONS' || table === '') {
       parseOptions(sn, body);
-      return textOut(res, 'OK');
+      return reply('OK');
     }
     trace('dev', sn, 'table=' + table + ' (' + body.length + ' bytes, ignored)');
-    return textOut(res, 'OK');
+    return reply('OK');
   }
 
   if (route === '/iclock/getrequest') {
     const d = touchDevice(sn, req);
     const pending = (state.queue[sn] || []).filter((c) => !c.sent);
-    if (!pending.length) return textOut(res, 'OK');
+    if (!pending.length) return reply('OK');
     const lines = pending.map((c) => { c.sent = Date.now(); return 'C:' + c.id + ':' + c.cmd; });
     trace('srv', sn, 'sending ' + lines.length + ' command(s)');
     if (d) d.lastCmd = Date.now();
-    return textOut(res, lines.join('\n') + '\n');
+    return reply(lines.join('\n') + '\n');
   }
 
   if (route === '/iclock/devicecmd') {
@@ -588,14 +597,14 @@ async function handleDevice(req, res, route, q) {
         trace('dev', sn, 'devicecmd: ' + line.slice(0, 120));
       }
     }
-    return textOut(res, 'OK');
+    return reply('OK');
   }
 
   // fdata / querydata / edata and anything else the firmware probes
   await readBody(req);
   touchDevice(sn, req);
   trace('dev', sn, 'unhandled ' + req.method + ' ' + req.url);
-  return textOut(res, 'OK');
+  return reply('OK');
 }
 
 // Return=0 is the firmware's "done". Anything else means this build does not
@@ -901,18 +910,28 @@ function dirSize(dir) {
   return { total, files: files.sort((a, b) => b.bytes - a.bytes) };
 }
 
-function serverStats() {
+function serverStats(days) {
+  const span = Math.min(Math.max(Number(days) || 14, 1), 120);
   const store = dirSize(DATA_DIR);
+  const today = localDate(new Date());
   const byDay = {};
-  for (const r of state.logs) byDay[r.time.slice(0, 10)] = (byDay[r.time.slice(0, 10)] || 0) + 1;
+  const byHour = new Array(24).fill(0);
+  const byDevice = {};
+  for (const r of state.logs) {
+    const day = r.time.slice(0, 10);
+    byDay[day] = (byDay[day] || 0) + 1;
+    byDevice[r.sn] = (byDevice[r.sn] || 0) + 1;
+    if (day === today) byHour[Number(r.time.slice(11, 13)) || 0]++;
+  }
   const series = [];
   const d = new Date();
-  d.setDate(d.getDate() - 13);
-  for (let i = 0; i < 14; i++) {
+  d.setDate(d.getDate() - (span - 1));
+  for (let i = 0; i < span; i++) {
     const key = localDate(d);
     series.push({ date: key, count: byDay[key] || 0 });
     d.setDate(d.getDate() + 1);
   }
+  const hours = byHour.map((count, h) => ({ date: String(h).padStart(2, '0'), count }));
   const mem = process.memoryUsage();
   return {
     store,
@@ -922,7 +941,12 @@ function serverStats() {
       devices: Object.keys(state.devices).length,
       online: Object.values(state.devices).filter((x) => x.online).length,
     },
-    series,
+    series, hours, days: span, today,
+    devices: Object.values(state.devices).map((x) => ({
+      sn: x.sn, online: !!x.online, role: x.role || '',
+      lastSeen: x.lastSeen, clockOffset: x.clockOffset || 0,
+      punches: byDevice[x.sn] || 0,
+    })).sort((a, b) => b.punches - a.punches),
     proc: {
       uptime: Math.round(process.uptime()),
       rss: mem.rss, heapUsed: mem.heapUsed,
@@ -1027,7 +1051,7 @@ async function handleApi(req, res, route, q) {
     trace('info', '', 'door requested from ' + clientIp(req) + ' -> ' + online.length + ' terminal(s)');
     return jsonOut(res, { ok: true, targets: online, queued: queued.map((c) => ({ id: c.id, sn: c.sn })) });
   }
-  if (route === '/api/stats') return jsonOut(res, serverStats());
+  if (route === '/api/stats') return jsonOut(res, serverStats(q.get('days')));
   if (route === '/api/settings' && req.method === 'GET') {
     return jsonOut(res, {
       allowIps: state.settings.allowIps || [], yourIp: clientIp(req),
@@ -1233,6 +1257,7 @@ padding:7px 10px;font-size:13px;font-family:inherit;width:100%}
 .log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;max-height:260px;overflow:auto;line-height:1.7}
 .log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .log .dev{color:#7ee787}.log .srv{color:#79c0ff}.log .err{color:#f87171}.log .info{color:var(--dim)}
+.log .rep{color:#d2a8ff}
 .hint{color:var(--dim);font-size:12px;line-height:1.7}
 .scroll table{min-width:640px}
 .grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
@@ -1314,7 +1339,8 @@ h1{font-size:15px}
   <button class="tab" data-tab="log">Live log</button>
   <button class="tab" data-tab="door">Door</button>
   <button class="tab" data-tab="dev">Devices</button>
-  <button class="tab" data-tab="srv">Server &amp; API</button>
+  <button class="tab" data-tab="info">Server info</button>
+  <button class="tab" data-tab="srv">Settings &amp; API</button>
 </nav>
 
 <div class="wrap">
@@ -1497,7 +1523,14 @@ h1{font-size:15px}
         <div class="body" id="devBox"><div class="hint">No device has connected yet.</div></div>
       </div>
       <div class="panel">
-        <h2>Protocol trace</h2>
+        <h2>Protocol trace
+          <span class="row">
+            <input id="trq" placeholder="filter" style="width:130px" oninput="renderTrace()">
+            <label class="hint" style="display:flex;align-items:center;gap:5px">
+              <input id="trFollow" type="checkbox" checked onchange="renderTrace()"> follow
+            </label>
+          </span>
+        </h2>
         <div class="log body" id="trace"></div>
       </div>
       <div class="panel">
@@ -1554,14 +1587,24 @@ h1{font-size:15px}
 </section>
 
 <!-- ---------------------------------------------------------------- server -->
-<section data-panel="srv" hidden>
+<section data-panel="info" hidden>
   <div class="panel">
     <h2>Server
-      <span class="row"><button onclick="loadStats()">Refresh</button></span>
+      <span class="row">
+        <span class="seg" id="sRange">
+          <button data-d="7" onclick="setStatDays(7)">7 days</button>
+          <button class="on" data-d="14" onclick="setStatDays(14)">14 days</button>
+          <button data-d="30" onclick="setStatDays(30)">30 days</button>
+          <button data-d="90" onclick="setStatDays(90)">90 days</button>
+        </span>
+        <button onclick="loadStats()">Refresh</button>
+      </span>
     </h2>
     <div id="statBox" class="body"><div class="hint">Loading...</div></div>
   </div>
+</section>
 
+<section data-panel="srv" hidden>
   <div class="panel">
     <h2>Attendance rules</h2>
     <div class="body">
@@ -1623,6 +1666,7 @@ window.onerror = function(msg, src, line, col){
 var LAB = {verify:{},status:{}};
 var timer = null;
 var ATT_SEEDED = false;
+var EVENTS = [];
 
 function q(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
@@ -1683,16 +1727,25 @@ function setRange(scope, days){
 }
 var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
 var DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-// "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25 AM"}
+// Clocks read 24-hour throughout: the punches come off the terminals that way
+// and a shift that runs past noon is easier to scan without AM/PM.
+function pad2(n){ return String(n).padStart(2, '0'); }
+function clock(t){
+  var d = t instanceof Date ? t : new Date(t);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+function stampOf(t){
+  var d = t instanceof Date ? t : new Date(t);
+  return pad2(d.getDate()) + ' ' + MONTHS[d.getMonth()] + ' ' + clock(d);
+}
+// "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25"}
 function fmtStamp(str){
   var m = /^([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[ T]([0-9]{2}):([0-9]{2}))?/.exec(str || '');
   if (!m) return { date: str || '', time: '' };
   var dt = new Date(+m[1], +m[2] - 1, +m[3]);
   var date = m[3] + ' ' + MONTHS[+m[2] - 1] + ' (' + DAYS[dt.getDay()] + ')';
   if (m[4] === undefined) return { date: date, time: '' };
-  var hh = +m[4], ap = hh < 12 ? 'AM' : 'PM';
-  var h12 = hh % 12; if (!h12) h12 = 12;
-  return { date: date, time: h12 + ':' + m[5] + ' ' + ap };
+  return { date: date, time: m[4] + ':' + m[5] };
 }
 
 var TAB = 'att';
@@ -1706,7 +1759,8 @@ function showTab(name){
   try { localStorage.setItem('tab', name); } catch (e) {}
   if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
   if (name === 'door') loadDoor();
-  if (name === 'srv') { loadStats(); loadIps(); }
+  if (name === 'info') loadStats();
+  if (name === 'srv') loadIps();
   refresh();
 }
 document.getElementById('tabs').addEventListener('click', function(e){
@@ -1728,7 +1782,7 @@ function boot(){
   q('fto').value = isoDay(0);
   showTab(saved);
   loadIps();
-  setInterval(function(){ if (TAB === 'srv') loadStats(); }, 30000);
+  setInterval(function(){ if (TAB === 'info') loadStats(); }, 30000);
   setInterval(function(){ if (TAB === 'door') loadDoor(); }, 5000);
 }
 
@@ -1737,6 +1791,26 @@ function refresh(){
     .then(function(r){ return r.json(); })
     .then(render)
     .catch(function(){ q('hdrTick').textContent = 'server unreachable'; });
+}
+
+// Newest first, so following means staying pinned to the top. With follow off
+// the scroll position is held across refreshes, which is what makes reading
+// back through a trace on a live server possible at all.
+function renderTrace(){
+  var box = q('trace');
+  if (!box) return;
+  var term = (q('trq').value || '').toLowerCase();
+  var list = EVENTS;
+  if (term) list = list.filter(function(e){
+    return (e.kind + ' ' + e.sn + ' ' + e.msg).toLowerCase().indexOf(term) >= 0;
+  });
+  var at = box.scrollTop;
+  box.innerHTML = list.map(function(e){
+    return '<div class="' + e.kind + '">' + clock(e.t)
+      + ' [' + esc(e.sn) + '] ' + esc(e.msg) + '</div>';
+  }).join('')
+    || '<div class="info">' + (term ? 'nothing matches that filter' : 'no traffic yet') + '</div>';
+  box.scrollTop = q('trFollow').checked ? 0 : at;
 }
 
 function render(s){
@@ -1757,7 +1831,7 @@ function render(s){
   q('cUsers').textContent = s.totals.users;
   q('cDev').textContent   = s.totals.devices;
   q('hdrPort').textContent = 'port ' + s.port + ' - ' + (s.tz || 'local time');
-  q('hdrTick').textContent = 'updated ' + new Date().toLocaleTimeString();
+  q('hdrTick').textContent = 'updated ' + clock(new Date());
 
   var online = s.devices.filter(function(d){ return d.online; });
   var h = q('hdrDev');
@@ -1837,10 +1911,8 @@ function render(s){
   q('emptyUsers').style.display = s.users.length ? 'none' : 'block';
 
   // trace
-  q('trace').innerHTML = s.events.map(function(e){
-    return '<div class="' + e.kind + '">' + new Date(e.t).toLocaleTimeString()
-      + ' [' + esc(e.sn) + '] ' + esc(e.msg) + '</div>';
-  }).join('') || '<div class="info">no traffic yet</div>';
+  EVENTS = s.events;
+  renderTrace();
 
   // queue
   q('queue').innerHTML = s.queue.map(function(c){
@@ -1951,10 +2023,10 @@ function loadDoor(){
           + (c.ok ? ' accepted' : ' refused')
         : (c.sent ? '<span style="color:var(--warn)">no reply yet</span>'
                   : '<span style="color:var(--dim)">not collected</span>');
-      return '<tr><td class="mono">' + new Date(c.created).toLocaleTimeString() + '</td>'
+      return '<tr><td class="mono">' + clock(c.created) + '</td>'
         + '<td class="mono" style="color:#8b949e">' + esc(c.sn.slice(-4)) + '</td>'
         + '<td class="mono">' + esc(c.cmd) + (c.probe ? ' <span class="tag">test</span>' : '') + '</td>'
-        + '<td>' + (c.sent ? new Date(c.sent).toLocaleTimeString() : '&mdash;') + '</td>'
+        + '<td>' + (c.sent ? clock(c.sent) : '&mdash;') + '</td>'
         + '<td>' + reply + '</td></tr>';
     }).join('');
     q('emptyDoor').style.display = j.items.length ? 'none' : 'block';
@@ -2004,6 +2076,7 @@ function setRole(sn, role){
 }
 var ATT = null, PEOPLE = [], FACE = 1;
 function hm(m){ return (m/60|0) + 'h ' + (m%60) + 'm'; }
+function num(n){ return (Number(n) || 0).toLocaleString(); }
 function setFace(on){
   FACE = on ? 1 : 0;
   q('aFace1').className = on ? 'on' : '';
@@ -2235,23 +2308,35 @@ function attCsv(){
   a.click();
 }
 
-function spark(series){
+// Bars are drawn rather than pulled from a chart library: the dashboard ships
+// as one file with no network access of its own, and a bar chart is a rect and
+// a label. Every bar carries its own value as a tooltip.
+function bars(series, label, unit){
+  if (!series.length) return '<div class="hint">nothing in this range</div>';
   var max = Math.max.apply(null, series.map(function(p){ return p.count; }).concat([1]));
-  var w = 13, gap = 4, h = 44;
-  return '<svg width="' + (series.length*(w+gap)) + '" height="' + (h+18) + '">'
+  var w = series.length > 40 ? 7 : 13, gap = series.length > 40 ? 2 : 4, h = 64;
+  var every = Math.ceil(series.length / 16);      // keep the axis readable
+  return '<svg width="' + (series.length*(w+gap)) + '" height="' + (h+18) + '" role="img">'
     + series.map(function(p, i){
         var bh = Math.max(2, Math.round(p.count / max * h));
         return '<rect x="' + (i*(w+gap)) + '" y="' + (h-bh) + '" width="' + w + '" height="' + bh
-          + '" rx="2" fill="' + (p.count ? '#2f81f7' : '#30363d') + '"><title>' + p.date + ': '
-          + p.count + ' punches</title></rect>'
-          + '<text x="' + (i*(w+gap)+w/2) + '" y="' + (h+13) + '" font-size="9" fill="#8b949e"'
-          + ' text-anchor="middle">' + p.date.slice(8) + '</text>';
+          + '" rx="2" fill="' + (p.count ? '#2f81f7' : '#30363d') + '"><title>'
+          + esc(label(p)) + ': ' + p.count + ' ' + unit + '</title></rect>'
+          + (i % every ? '' : '<text x="' + (i*(w+gap)+w/2) + '" y="' + (h+13)
+             + '" font-size="9" fill="#8b949e" text-anchor="middle">' + esc(p.date.slice(-2)) + '</text>');
       }).join('')
     + '</svg>';
 }
 
+var STAT_DAYS = 14;
+function setStatDays(n){
+  STAT_DAYS = n;
+  markRange('sRange', n);
+  loadStats();
+}
+
 function loadStats(){
-  fetch('/api/stats').then(function(r){ return r.json(); }).then(function(t){
+  fetch('/api/stats?days=' + STAT_DAYS).then(function(r){ return r.json(); }).then(function(t){
     var memPct = Math.round((1 - t.host.freeMem/t.host.totalMem) * 100);
     q('statBox').innerHTML = '<div class="grid">'
       + kpi('Stored data', bytes(t.store.total))
@@ -2264,8 +2349,29 @@ function loadStats(){
       + kpi('Host memory', memPct + '%', memPct > 85 ? 'var(--warn)' : '')
       + kpi('Load (1m)', t.host.load[0], t.host.load[0] > t.host.cpus ? 'var(--warn)' : '')
       + '</div>'
-      + '<div class="hint" style="margin-bottom:6px">Punches per day (last 14 days)</div>'
-      + '<div style="overflow-x:auto">' + spark(t.series) + '</div>'
+      + '<div class="hint" style="margin-bottom:6px">Punches per day &mdash; last '
+      + t.days + ' days, ' + t.series.reduce(function(a,p){ return a+p.count; }, 0) + ' in total</div>'
+      + '<div style="overflow-x:auto">'
+      + bars(t.series, function(p){ return p.date; }, 'punches') + '</div>'
+      + '<div class="hint" style="margin:14px 0 6px">Punches per hour today ('
+      + esc(t.today) + ') &mdash; 24h clock</div>'
+      + '<div style="overflow-x:auto">'
+      + bars(t.hours, function(p){ return p.date + ':00'; }, 'punches') + '</div>'
+      + '<div class="hint" style="margin:14px 0 6px">Terminals</div>'
+      + '<div class="scroll"><table><thead><tr><th>Serial</th><th>State</th><th>Gate</th>'
+      + '<th>Clock</th><th>Punches</th><th>Last contact</th></tr></thead><tbody>'
+      + t.devices.map(function(d){
+          return '<tr><td class="mono">' + esc(d.sn) + '</td>'
+            + '<td><span class="badge ' + (d.online?'on':'off') + '">'
+            + (d.online?'online':'offline') + '</span></td>'
+            + '<td>' + (d.role === 'in' ? 'Check-in' : d.role === 'out' ? 'Check-out' : '&mdash;') + '</td>'
+            + '<td>' + (d.clockOffset
+                ? Math.abs(d.clockOffset) + ' min ' + (d.clockOffset > 0 ? 'behind' : 'ahead')
+                : 'in step') + '</td>'
+            + '<td class="mono">' + num(d.punches) + '</td>'
+            + '<td>' + (d.lastSeen ? esc(stampOf(d.lastSeen)) : 'never') + '</td></tr>';
+        }).join('')
+      + '</tbody></table></div>'
       + '<div class="hint" style="margin-top:12px">Files in ./data &mdash; '
       + t.store.files.map(function(f){ return esc(f.name) + ' <b>' + bytes(f.bytes) + '</b>'; }).join(' &middot; ')
       + '</div>'
