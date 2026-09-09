@@ -28,35 +28,75 @@ const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
 const SET_FILE = path.join(DATA_DIR, 'settings.json');
 const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
-// The terminals report punches in UTC: a punch received at 11:34:10 server
-// time carries the stamp 06:04:09. Shift on ingest so everything downstream
-// (day grouping, filters, exports) works in Indian time. Set to 0 if you
-// reconfigure the terminals to local time.
+// The terminals stamp punches with their own clock, which is rarely Indian
+// time: one left on UTC is 330 min behind, one set to GMT+5:00 is 30 min
+// behind. Shift on ingest so everything downstream (day grouping, filters,
+// exports) works in Indian time. Set DEVICE_OFFSET_MIN to pin it by hand.
 const FORCED_OFFSET = process.env.DEVICE_OFFSET_MIN === undefined
   ? null : Number(process.env.DEVICE_OFFSET_MIN);
+// A live punch arrives as its own tiny push; anything bigger is a backlog dump.
+const LIVE_BATCH_ROWS = 3;
+const MAX_OFFSET_MIN = 14 * 60;   // beyond any real timezone, so: a stale dump
 
-// A live push arrives within seconds of the punch, so (now - stamp) reveals the
-// terminal's clock offset. Backlog uploads show huge deltas and are ignored for
-// detection - they reuse whatever the device last measured. Fix the terminal's
-// timezone to GMT+5:30 and this settles back to 0 on its own.
-function clockOffsetFor(sn, devTime) {
+// The gap between a punch's stamp and its arrival is the terminal's clock error
+// at that moment - but only for a punch pushed live. Clock and timezone
+// mistakes always land on a quarter hour, so round the gap to the nearest
+// 15 min and take it only when what is left over is plausible upload latency;
+// a backlog row is stale by an arbitrary amount and yields nothing.
+function liveOffset(devTime, at) {
+  const parsed = Date.parse(String(devTime).replace(' ', 'T'));
+  if (!parsed) return null;
+  const gap = (at - parsed) / 60000;
+  const off = Math.round(gap / 15) * 15;
+  if (Math.abs(gap - off) > 5 || Math.abs(off) > MAX_OFFSET_MIN) return null;
+  return off;
+}
+
+// Backlog dumps arrive many rows at a time and would poison the measurement,
+// so only live-sized batches are measured; a dump reuses whatever the device
+// last reported.
+function detectClockOffset(sn, devTime, rows) {
   if (FORCED_OFFSET !== null) return FORCED_OFFSET;
   const d = state.devices[sn];
-  const parsed = Date.parse(String(devTime).replace(' ', 'T'));
-  if (parsed) {
-    const delta = Math.round((Date.now() - parsed) / 60000);
-    for (const cand of [0, 330]) {
-      if (Math.abs(delta - cand) <= 10) {
-        if (d && d.clockOffset !== cand) {
-          d.clockOffset = cand;
-          trace('info', sn, 'clock offset detected: ' + cand + ' min');
-          saveSoon();
-        }
-        return cand;
-      }
-    }
+  const known = (d && d.clockOffset) || 0;
+  if (!d || rows > LIVE_BATCH_ROWS) return known;
+  const off = liveOffset(devTime, Date.now());
+  if (off === null) return known;
+  if (off === known) return known;
+  d.clockOffset = off;
+  trace('info', sn, 'clock offset now ' + off + ' min (was ' + known + ')');
+  restampDevice(sn);
+  saveSoon();
+  return off;
+}
+
+// A stored time is only the device stamp plus the clock error, so punches
+// recorded under a wrong offset can be re-derived instead of staying wrong
+// forever. Each one is re-derived from its own arrival gap rather than from the
+// offset measured now, so that a terminal whose clock is genuinely re-set does
+// not drag older, correctly stamped history along with it. Punches with no
+// devTime, or that came in a backlog dump, carry no such evidence and are left
+// exactly as they are.
+function restampDevice(sn) {
+  let changed = 0;
+  for (const r of state.logs) {
+    if (r.sn !== sn || !r.devTime || !r.recv) continue;
+    const off = liveOffset(r.devTime, r.recv);
+    if (off === null) continue;
+    const t = shiftStamp(r.devTime, off);
+    if (t !== r.time) { r.time = t; changed++; }
   }
-  return (d && d.clockOffset) || 0;
+  if (!changed) return;
+  seen.clear();
+  for (const r of state.logs) seen.add(punchKey(r));
+  try {
+    fs.writeFileSync(ATT_FILE, state.logs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  } catch (e) { trace('err', sn, 'attlog rewrite: ' + e.message); }
+  trace('info', sn, 'restamped ' + changed + ' past punch(es)');
+}
+
+function punchKey(r) {
+  return r.sn + '|' + r.pin + '|' + r.time + '|' + r.status;
 }
 
 function shiftStamp(t, mins) {
@@ -93,7 +133,7 @@ function loadState() {
       if (!line.trim()) continue;
       const r = JSON.parse(line);
       state.logs.push(r);
-      seen.add(r.sn + '|' + r.pin + '|' + r.time + '|' + r.status);
+      seen.add(punchKey(r));
     }
   } catch (e) { /* first run */ }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
@@ -234,8 +274,6 @@ function buildCommand(kind, p) {
     case 'info':     return 'INFO';
     case 'check':    return 'CHECK';                       // force full re-sync from device
     case 'synctime': return 'SET OPTION DateTime=' + zkTime(new Date());
-    case 'clearlog': return 'CLEAR LOG';
-    case 'cleardata':return 'CLEAR DATA';
     case 'queryuser':return 'DATA QUERY USERINFO PIN=' + (p.pin || '*');
     case 'queryatt': {
       const end = new Date();
@@ -263,9 +301,9 @@ const STATUS = {
   4: 'OT-In', 5: 'OT-Out', 255: 'Punch',
 };
 
-function addPunch(sn, pin, devTime, status, verify, workcode, extra) {
-  const time = shiftStamp(devTime, clockOffsetFor(sn, devTime));
-  const key = sn + '|' + pin + '|' + time + '|' + status;
+function addPunch(sn, pin, devTime, status, verify, workcode, extra, offset) {
+  const time = shiftStamp(devTime, offset);
+  const key = punchKey({ sn, pin: String(pin), time, status: Number(status) || 0 });
   if (seen.has(key)) return false;
   seen.add(key);
   const rec = {
@@ -281,7 +319,7 @@ function addPunch(sn, pin, devTime, status, verify, workcode, extra) {
 }
 
 function parseAttlog(sn, body) {
-  let n = 0;
+  const rows = [];
   for (const raw of body.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
@@ -290,7 +328,16 @@ function parseAttlog(sn, body) {
     const pin = f[0].trim();
     const time = (f[1] || '').trim();
     if (!pin || !/\d{4}-\d{2}-\d{2}/.test(time)) continue;
-    if (addPunch(sn, pin, time, f[2], f[3], f[4], f.slice(5).join('|'))) n++;
+    rows.push({ pin, time, f });
+  }
+  // one measurement for the batch, taken from its newest stamp - that is the
+  // punch that just happened, the rest may be minutes older
+  const newest = rows.reduce((a, r) => (r.time > a ? r.time : a), '');
+  const off = detectClockOffset(sn, newest, rows.length);
+  let n = 0;
+  for (const r of rows) {
+    const f = r.f;
+    if (addPunch(sn, r.pin, r.time, f[2], f[3], f[4], f.slice(5).join('|'), off)) n++;
   }
   const d = state.devices[sn];
   if (d) d.pushCount = (d.pushCount || 0) + n;
@@ -644,15 +691,19 @@ function dayEvents(pin, date, face) {
   for (const r of rows) {
     const prev = evs[evs.length - 1];
     const dir = dirOf(r);
-    // With gate roles assigned an opposite-gate punch is a real movement no
-    // matter how fast it followed. With no roles, every close tap is the same
-    // person still at the door.
-    // measured from the last tap of the burst, not the first: a run of taps
-    // 30s apart is one person at one door however long the run gets
-    const sameMove = prev && (tsOf(r.time) - tsOf(prev.until)) < win
-      && (!dir || !prev.dir || dir === prev.dir);
-    if (sameMove) { prev.taps++; prev.until = r.time; continue; }
-    evs.push({ time: r.time, until: r.time, dir, verify: r.verify, sn: r.sn, taps: 1 });
+    // Where both gates are known, direction alone decides: you cannot arrive
+    // twice without leaving in between, so a second punch at the same gate is
+    // the same movement however much later it came - the door was slow, the
+    // read did not take, someone tapped again on the way past. Only the
+    // opposite gate starts a new movement. Without gate roles there is no
+    // direction to reason from, so closeness in time is all that is left.
+    const sameMove = prev && (dir && prev.dir
+      ? dir === prev.dir
+      : (tsOf(r.time) - tsOf(prev.time)) < win);
+    // the run counts as happening at its last tap: that is the one the person
+    // actually walked through on
+    if (sameMove) { prev.taps++; prev.time = r.time; continue; }
+    evs.push({ time: r.time, from: r.time, dir, verify: r.verify, sn: r.sn, taps: 1 });
   }
   labelMovements(evs);
   evs.taps = rows.length;
@@ -730,6 +781,31 @@ function attendance(pin, from, to, face) {
   };
 }
 
+// The same run of taps that the attendance model folds into one movement also
+// fills the raw log with near-identical rows. Fold them here too, keeping the
+// last tap of each run and remembering how many there were, so the log reads
+// as movements. ?raw=1 turns it off and shows every punch as recorded - the
+// stored history is never touched either way.
+function collapseRepeats(rows) {
+  const asc = rows.slice().sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+  const open = new Map();     // pin -> the run currently being extended
+  const out = [];
+  for (const r of asc) {
+    const dir = dirOf(r) || 'none';
+    const run = open.get(r.pin);
+    // a run never spans a date: the first punch of a day is always an arrival
+    if (run && run.dir === dir && dayOf(run.day) === dayOf(r.time)) {
+      run.taps++;
+      out[run.at] = Object.assign({}, r, { taps: run.taps, from: run.from });
+      run.day = r.time;
+      continue;
+    }
+    open.set(r.pin, { dir, taps: 1, from: r.time, day: r.time, at: out.length });
+    out.push(Object.assign({}, r, { taps: 1, from: r.time }));
+  }
+  return out;
+}
+
 function filterLogs(q) {
   const term = (q.get('q') || '').toLowerCase();
   const fPin = (q.get('pin') || '').trim().toLowerCase();
@@ -757,6 +833,7 @@ function filterLogs(q) {
   if (fVerify === 'face') rows = rows.filter(isFace);
   else if (fVerify) rows = rows.filter((r) => String(r.verify) === fVerify);
   if (fDir) rows = rows.filter((r) => (dirOf(r) || 'none') === fDir);
+  if ((q.get('raw') || '') !== '1') rows = collapseRepeats(rows);
   return rows.slice()
     .sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0))
     .slice(0, limit)
@@ -1231,8 +1308,14 @@ h1{font-size:15px}
              border-radius:8px;box-shadow:0 12px 32px rgba(0,0,0,.5)"></div>
       </div>
       <input type="hidden" id="aUser">
-      <input id="aFrom" type="date" style="width:150px" onchange="loadAtt()">
-      <input id="aTo" type="date" style="width:150px" onchange="loadAtt()">
+      <span class="seg" id="aRange">
+        <button class="on" data-d="0" onclick="setRange('att',0)">Today</button>
+        <button data-d="7" onclick="setRange('att',7)">7 days</button>
+        <button data-d="30" onclick="setRange('att',30)">30 days</button>
+        <button data-d="90" onclick="setRange('att',90)">90 days</button>
+      </span>
+      <input id="aFrom" type="date" style="width:150px" onchange="markRange('aRange','x');loadAtt()">
+      <input id="aTo" type="date" style="width:150px" onchange="markRange('aRange','x');loadAtt()">
       <span class="seg">
         <button id="aFace1" class="on" onclick="setFace(1)">Face only</button>
         <button id="aFace0" onclick="setFace(0)">Every mode</button>
@@ -1273,8 +1356,17 @@ h1{font-size:15px}
         <option value="face">Verified by: Face</option>
         <option value="">Verified by: all</option>
       </select>
-      <input id="ffrom" type="date" style="width:150px" onchange="refresh()">
-      <input id="fto" type="date" style="width:150px" onchange="refresh()">
+      <span class="seg" id="fRange">
+        <button class="on" data-d="0" onclick="setRange('log',0)">Today</button>
+        <button data-d="7" onclick="setRange('log',7)">7 days</button>
+        <button data-d="30" onclick="setRange('log',30)">30 days</button>
+        <button data-d="" onclick="setRange('log','')">All</button>
+      </span>
+      <input id="ffrom" type="date" style="width:150px" onchange="markRange('fRange','x');refresh()">
+      <input id="fto" type="date" style="width:150px" onchange="markRange('fRange','x');refresh()">
+      <label class="hint" style="display:flex;align-items:center;gap:6px">
+        <input id="fraw" type="checkbox" onchange="refresh()"> every tap
+      </label>
       <button onclick="clearFilters()">Reset</button>
     </div>
     <div class="scroll" style="max-height:620px">
@@ -1390,7 +1482,6 @@ h1{font-size:15px}
             <button onclick="cmd('info')">Device info</button>
             <button onclick="cmd('check')">Full re-sync</button>
             <button onclick="cmd('reboot')">Reboot</button>
-            <button class="d" onclick="cmd('clearlog',null,'Erase ALL attendance logs stored on the device?')">Erase device logs</button>
           </div>
         </div>
       </div>
@@ -1486,8 +1577,16 @@ h1{font-size:15px}
 </div>
 
 <script>
+// A thrown error used to stop the whole dashboard silently: everything still
+// drew, but nothing ever loaded. Surface it where it can be seen.
+window.onerror = function(msg, src, line, col){
+  var el = document.getElementById('hdrTick');
+  if (el){ el.textContent = 'script error: ' + msg + ' (line ' + line + ')'; el.className = 'badge off'; }
+  return false;
+};
 var LAB = {verify:{},status:{}};
 var timer = null;
+var ATT_SEEDED = false;
 
 function q(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
@@ -1508,14 +1607,43 @@ function params(){
   if (q('fverify').value) p.set('verify', q('fverify').value);
   if (q('ffrom').value) p.set('from', q('ffrom').value);
   if (q('fto').value) p.set('to', q('fto').value);
+  if (q('fraw').checked) p.set('raw', '1');
   p.set('limit','300');
   return p;
 }
 function debounced(){ clearTimeout(timer); timer = setTimeout(refresh, 250); }
 function clearFilters(){
-  ['fq','fpin','fname','fdir','ffrom','fto'].forEach(function(id){ q(id).value = ''; });
+  ['fq','fpin','fname','fdir'].forEach(function(id){ q(id).value = ''; });
   q('fverify').value = 'face';
-  refresh();
+  q('fraw').checked = false;
+  setRange('log', 0);                // reset lands on today, like a fresh open
+}
+
+function isoDay(back){
+  var d = new Date(Date.now() - (Number(back) || 0) * 86400000);
+  var p = function(x){ return String(x).padStart(2, '0'); };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+
+// Both the log and the attendance report open on today and share one set of
+// range buttons, so "what happened today" is the default question either tab
+// answers. Typing in a date box directly drops the highlight - the range is
+// then whatever was typed.
+function markRange(id, days){
+  var box = document.getElementById(id);
+  if (!box) return;
+  var bs = box.getElementsByTagName('button');
+  for (var i = 0; i < bs.length; i++)
+    bs[i].className = bs[i].getAttribute('data-d') === String(days) ? 'on' : '';
+}
+
+function setRange(scope, days){
+  var att = scope === 'att';
+  var all = days === '' || days === null;
+  document.getElementById(att ? 'aFrom' : 'ffrom').value = all ? '' : isoDay(days);
+  document.getElementById(att ? 'aTo' : 'fto').value = all ? '' : isoDay(0);
+  markRange(att ? 'aRange' : 'fRange', all ? '' : days);
+  if (att) loadAtt(); else refresh();
 }
 var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
 var DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -1540,6 +1668,7 @@ function showTab(name){
   var secs = document.querySelectorAll('section[data-panel]');
   for (var j = 0; j < secs.length; j++) secs[j].hidden = secs[j].dataset.panel !== name;
   try { localStorage.setItem('tab', name); } catch (e) {}
+  if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
   if (name === 'door') loadDoor();
   if (name === 'srv') { loadStats(); loadIps(); }
   refresh();
@@ -1548,11 +1677,19 @@ document.getElementById('tabs').addEventListener('click', function(e){
   var b = e.target.closest('.tab');
   if (b) showTab(b.dataset.tab);
 });
+window.addEventListener('hashchange', function(){
+  var h = location.hash.slice(1);
+  if (h && h !== TAB && document.querySelector('section[data-panel="' + h + '"]')) showTab(h);
+});
 
 function boot(){
-  var saved = 'att';
-  try { saved = localStorage.getItem('tab') || 'att'; } catch (e) {}
+  // the hash wins so a tab can be linked to directly, then the last tab used
+  var saved = location.hash.slice(1);
+  if (!saved) { try { saved = localStorage.getItem('tab') || 'att'; } catch (e) { saved = 'att'; } }
   if (!document.querySelector('section[data-panel="' + saved + '"]')) saved = 'att';
+  // every panel opens on today; the range buttons widen it from there
+  q('ffrom').value = isoDay(0);
+  q('fto').value = isoDay(0);
   showTab(saved);
   loadIps();
   setInterval(function(){ if (TAB === 'srv') loadStats(); }, 30000);
@@ -1609,7 +1746,11 @@ function render(s){
         + 'Faces <b>' + esc(i.FaceCount || i.face_count || '?') + '</b> &middot; '
         + 'Users <b>' + esc(i.UserCount || i.user_count || '?') + '</b> &middot; '
         + 'Logs <b>' + esc(i.TransactionCount || i.transaction_count || '?') + '</b><br>'
-        + 'Last contact <b>' + (d.lastSeen ? ago(d.lastSeen) : 'never') + '</b>'
+        + 'Last contact <b>' + (d.lastSeen ? ago(d.lastSeen) : 'never') + '</b><br>'
+        + (d.clockOffset
+            ? 'Terminal clock <b>' + Math.abs(d.clockOffset) + ' min '
+              + (d.clockOffset > 0 ? 'behind' : 'ahead') + '</b> &middot; punches corrected to Indian time'
+            : 'Terminal clock <b>in step</b> with Indian time')
         + '</div>'
         + '<div class="row" style="margin-top:6px;align-items:center">'
         + '<span class="hint">Gate role</span>'
@@ -1632,7 +1773,8 @@ function render(s){
     tb += '<tr><td class="mono">' + esc(f.date) + ' <b>' + esc(f.time) + '</b></td>'
        + '<td class="mono">' + esc(r.pin) + '</td>'
        + '<td>' + (esc(r.name) || '<span style="color:#8b949e">&mdash;</span>') + '</td>'
-       + '<td><span class="pill ' + cls + '">' + esc(st) + '</span></td>'
+       + '<td><span class="pill ' + cls + '">' + esc(st) + '</span>'
+       + (r.taps > 1 ? ' <span class="tag">' + r.taps + ' taps</span>' : '') + '</td>'
        + '<td>' + esc(LAB.verify[r.verify] || ('Mode ' + r.verify)) + '</td>'
        + '<td class="mono" style="color:#8b949e">' + esc(r.sn) + '</td></tr>';
   }
@@ -1640,12 +1782,9 @@ function render(s){
   q('emptyLogs').style.display = s.logs.length ? 'none' : 'block';
 
   PEOPLE = s.users;
-  if (!q('aTo').value){
-    var now = new Date(), pad = function(x){ return String(x).padStart(2,'0'); };
-    var iso = function(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); };
-    q('aTo').value = iso(now);
-    q('aFrom').value = iso(new Date(now.getTime() - 7*86400000));
-    loadAtt();                        // open on everyone, last 7 days
+  if (!q('aTo').value && !ATT_SEEDED){
+    ATT_SEEDED = true;
+    setRange('att', 0);               // open on everyone, today
   }
 
   // users
@@ -1787,7 +1926,7 @@ function loadDoor(){
 }
 
 function doorProbe(){
-  if (!confirm('Send every unlock wording to each online terminal once?\n\n'
+  if (!confirm('Send every unlock wording to each online terminal once?\\n\\n'
     + 'If one of them works the door will open during the test.')) return;
   fetch('/api/door/probe', {method:'POST'})
     .then(function(r){ return r.json(); })
@@ -1881,7 +2020,6 @@ document.addEventListener('click', function(e){
 });
 
 function loadAtt(){
-  if (!q('aTo').value) return;                     // dates not seeded yet
   var pin = q('aUser').value;
   var p = new URLSearchParams({from:q('aFrom').value, to:q('aTo').value, face:FACE});
   if (pin) p.set('pin', pin);
@@ -2004,7 +2142,7 @@ function openDay(i){
     for (var k = 0; k < d.events.length; k++){
       var e = d.events[k], prev = d.events[k-1];
       if (prev){
-        var mins = Math.round((new Date(e.time.replace(' ','T')) - new Date(prev.until.replace(' ','T')))/60000);
+        var mins = Math.round((new Date(e.time.replace(' ','T')) - new Date(prev.time.replace(' ','T')))/60000);
         // an unmatched tap gets the elapsed time but no claim about where
         // the person was, because that is exactly what we do not know
         var g = GAP[e.label] || ['',''];
@@ -2015,7 +2153,7 @@ function openDay(i){
       html += '<div class="ev ' + (STEP[e.label] || 'x') + '">'
         + '<div><b>' + esc(e.label) + '</b> <span class="t" style="color:var(--dim)">'
         + esc(f.time) + '</span>'
-        + (e.taps > 1 ? ' <span class="tag">' + e.taps + ' taps to ' + esc(fmtStamp(e.until).time) + '</span>' : '')
+        + (e.taps > 1 ? ' <span class="tag">' + e.taps + ' taps, first ' + esc(fmtStamp(e.from).time) + '</span>' : '')
         + '</div>'
         + '<div class="hint">' + esc(LAB.verify[e.verify] || ('mode ' + e.verify))
         + ' &middot; gate ' + esc(e.sn) + '</div></div>';
