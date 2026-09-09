@@ -27,6 +27,7 @@ const ATT_FILE = path.join(DATA_DIR, 'attlog.jsonl');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
 const SET_FILE = path.join(DATA_DIR, 'settings.json');
+const MARK_FILE = path.join(DATA_DIR, 'marks.json');
 const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
 // The terminals stamp punches with their own clock, which is rarely Indian
 // time: one left on UTC is 330 min behind, one set to GMT+5:00 is 30 min
@@ -195,6 +196,12 @@ const state = {
   logs: [],      // attendance punches
   queue: {},     // sn -> pending command objects
   events: [],    // raw protocol trace
+  // punchKey -> 'in' | 'out', set by hand on the day timeline. Both terminals
+  // here are readers on the same door, so no gate role can say which way a
+  // person went; this is where a human says it instead. Keyed on the punch's
+  // dedupe key, so a re-sync of the same punch keeps its mark and a device
+  // never overwrites one.
+  marks: {},
   // allowIps: HR API allow-list, empty = denied. faceOnly: attendance counts
   // face-verified punches only. dwellSec: gate re-tap window, see below.
   settings: { allowIps: [], faceOnly: undefined, dwellSec: undefined, doorPin: '' },
@@ -212,6 +219,7 @@ function loadState() {
     }
   } catch (e) { /* first run */ }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
+  try { state.marks = JSON.parse(fs.readFileSync(MARK_FILE, 'utf8')); } catch (e) {}
   try { Object.assign(state.settings, JSON.parse(fs.readFileSync(SET_FILE, 'utf8'))); } catch (e) {}
   try {
     state.devices = JSON.parse(fs.readFileSync(DEV_FILE, 'utf8'));
@@ -244,6 +252,7 @@ function saveSoon() {
       fs.writeFileSync(USERS_FILE, JSON.stringify(state.users, null, 2));
       fs.writeFileSync(DEV_FILE, JSON.stringify(state.devices, null, 2));
       fs.writeFileSync(SET_FILE, JSON.stringify(state.settings, null, 2));
+      fs.writeFileSync(MARK_FILE, JSON.stringify(state.marks, null, 2));
     } catch (e) { console.error('save failed', e.message); }
   }, 800);
 }
@@ -697,7 +706,17 @@ function onUnlockReply(sn, item) {
 
 /* ------------------------------------------------------------------- API */
 
+// A direction someone set by hand on the day timeline. Nothing the terminals
+// send can overwrite it - the punch keeps its mark across every re-sync,
+// because the mark is filed under the punch's own dedupe key.
+function markOf(rec) {
+  const m = state.marks[punchKey(rec)];
+  return m === 'in' || m === 'out' ? m : '';
+}
+
 function dirOf(rec) {
+  const m = markOf(rec);
+  if (m) return m;
   if (rec.status === 0 || rec.status === 4 || rec.status === 3) return 'in';
   if (rec.status === 1 || rec.status === 5 || rec.status === 2) return 'out';
   const d = state.devices[rec.sn];
@@ -762,6 +781,18 @@ function labelMovements(evs) {
   const paired = Math.floor(mid.length / 2) * 2;
   for (let i = 0; i < paired; i++) mid[i].label = i % 2 ? 'Break end' : 'Break start';
   for (let i = paired; i < mid.length; i++) mid[i].label = 'Extra punch';
+  // Alternation is only a guess about which way someone went. Where a human
+  // has said it outright, the mark decides instead: an out is the departure
+  // when it ends the day and the start of a break anywhere else, an in is the
+  // arrival when it opens the day and the end of a break anywhere else. That
+  // is what turns a tap out and a tap straight back in from one unexplained
+  // extra punch into the break it actually was.
+  for (let i = 0; i < evs.length; i++) {
+    if (!evs[i].mark) continue;
+    evs[i].label = evs[i].mark === 'out'
+      ? (i === evs.length - 1 ? 'Check out' : 'Break start')
+      : (i === 0 ? 'Check in' : 'Break end');
+  }
   return evs;
 }
 
@@ -776,6 +807,7 @@ function dayEvents(pin, date, face) {
   const evs = [];
   for (const r of rows) {
     const prev = evs[evs.length - 1];
+    const mark = markOf(r);
     const dir = dirOf(r);
     // Where both gates are known, direction alone decides: you cannot arrive
     // twice without leaving in between, so a second punch at the same gate is
@@ -783,13 +815,29 @@ function dayEvents(pin, date, face) {
     // read did not take, someone tapped again on the way past. Only the
     // opposite gate starts a new movement. Without gate roles there is no
     // direction to reason from, so closeness in time is all that is left.
-    const sameMove = prev && (dir && prev.dir
-      ? dir === prev.dir
-      : (tsOf(r.time) - tsOf(prev.time)) < win);
+    //
+    // A punch someone marked by hand outranks both. It joins the movement
+    // before it only when that movement carries the same mark - two taps both
+    // marked out are one departure read twice - and otherwise always opens a
+    // new one, however close in time. That is the only thing that can tell a
+    // tap out and a tap straight back in apart from the terminal reading one
+    // face twice, because here both gates are readers on the same door.
+    // Unmarked taps still fold as before, so marking the two punches that
+    // matter does not shatter the double-reads around them.
+    const sameMove = prev && (mark
+      ? mark === prev.mark
+      : dir && prev.dir
+        ? dir === prev.dir
+        : (tsOf(r.time) - tsOf(prev.time)) < win);
+    const tap = { k: punchKey(r), t: r.time, sn: r.sn, v: r.verify, m: mark };
     // the run counts as happening at its last tap: that is the one the person
     // actually walked through on
-    if (sameMove) { prev.taps++; prev.time = r.time; continue; }
-    evs.push({ time: r.time, from: r.time, dir, verify: r.verify, sn: r.sn, taps: 1 });
+    if (sameMove) {
+      prev.taps++; prev.time = r.time; prev.key = tap.k; prev.rows.push(tap);
+      continue;
+    }
+    evs.push({ time: r.time, from: r.time, dir, mark, verify: r.verify, sn: r.sn,
+               taps: 1, key: tap.k, rows: [tap] });
   }
   labelMovements(evs);
   evs.taps = rows.length;
@@ -808,8 +856,12 @@ function daySummary(pin, date, face) {
     if (evs[i].label !== 'Break start') continue;
     const nxt = evs[i + 1];
     if (!nxt || nxt.label !== 'Break end') continue;
-    const min = Math.round((tsOf(nxt.time) - tsOf(evs[i].time)) / 60000);
-    if (min <= 0) continue;
+    // Tapping out and straight back in lands both punches in the same minute,
+    // so the rounded gap is zero and the break would vanish from the day
+    // entirely. A break that really happened costs at least a minute.
+    const ms = tsOf(nxt.time) - tsOf(evs[i].time);
+    if (ms < 0) continue;
+    const min = Math.max(1, Math.round(ms / 60000));
     breaks.push({ from: evs[i].time, to: nxt.time, min });
     breakMin += min;
   }
@@ -1244,6 +1296,28 @@ async function handleApi(req, res, route, q) {
     trace('info', p.sn, 'role set to ' + (d.role || 'unassigned'));
     return jsonOut(res, { ok: true, role: d.role });
   }
+  // Both terminals here are readers on the same door, so nothing in the
+  // protocol says which way a person went. This is where a human says it.
+  // The mark is filed under the punch's dedupe key, which is what a re-sync
+  // matches on, so pulling the same punch again never disturbs it.
+  if (route === '/api/punch/dir' && req.method === 'POST') {
+    const p = JSON.parse((await readBody(req)) || '{}');
+    // one punch, or a whole run at once - splitting a folded run sets both
+    // ends together, so it lands as one save and one redraw
+    const wanted = Array.isArray(p.marks) ? p.marks : [{ key: p.key, dir: p.dir }];
+    const done = [];
+    for (const w of wanted.slice(0, 50)) {
+      const key = String((w && w.key) || '');
+      if (!seen.has(key)) return jsonOut(res, { ok: false, error: 'unknown punch' }, 404);
+      const dir = ['in', 'out'].includes(w.dir) ? w.dir : '';
+      if (dir) state.marks[key] = dir; else delete state.marks[key];
+      done.push({ key, dir });
+      trace('info', key.split('|')[0], 'punch ' + key.split('|').slice(1, 3).join(' ')
+        + ' marked ' + (dir || 'automatic'));
+    }
+    saveSoon();
+    return jsonOut(res, { ok: true, marks: done });
+  }
   if (route === '/api/purge' && req.method === 'POST') {
     state.logs.length = 0;
     seen.clear();
@@ -1342,6 +1416,18 @@ border-radius:11px;box-sizing:border-box;background:var(--panel);border:2px soli
 .tl .ev.be:before{border-color:var(--ok)}
 .tl .ev.x{opacity:.5}
 .tl .t{font-variant-numeric:tabular-nums}
+/* hand-set direction: with two readers on one door, nothing in the protocol
+   says which way someone went, so this is where a person says it */
+.tapline{display:flex;flex-wrap:wrap;align-items:center;gap:7px;padding:4px 0 0}
+.dir{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.dir button{border:0;border-radius:0;background:transparent;color:var(--dim);
+padding:2px 9px;font-size:10.5px}
+.dir button:hover{color:#fff}
+.dir button.on.in{background:var(--ok);color:#06210f}
+.dir button.on.out{background:var(--warn);color:#241a00}
+.dir button.on.auto{background:#30363d;color:#fff}
+.tl .split{padding:2px 9px;font-size:10.5px;background:transparent;color:var(--dim)}
+.tl .split:hover{color:#fff}
 .gap{position:relative;margin-left:-4px;font-size:11px;color:var(--dim);padding:1px 0}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:80;
 background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 16px;
@@ -1787,25 +1873,30 @@ function setRange(scope, days){
 }
 var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
 var DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-// Clocks read 24-hour throughout: the punches come off the terminals that way
-// and a shift that runs past noon is easier to scan without AM/PM.
+// Clocks read 12-hour with AM/PM throughout - the way the wall clock and the
+// people reading this page say the time. The stored punch keeps its 24-hour
+// stamp; only the display changes.
 function pad2(n){ return String(n).padStart(2, '0'); }
+function ampm(h, m, s){
+  return (h % 12 || 12) + ':' + pad2(m) + (s === undefined ? '' : ':' + pad2(s))
+    + ' ' + (h < 12 ? 'AM' : 'PM');
+}
 function clock(t){
   var d = t instanceof Date ? t : new Date(t);
-  return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  return ampm(d.getHours(), d.getMinutes(), d.getSeconds());
 }
 function stampOf(t){
   var d = t instanceof Date ? t : new Date(t);
   return pad2(d.getDate()) + ' ' + MONTHS[d.getMonth()] + ' ' + clock(d);
 }
-// "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25"}
+// "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25 AM"}
 function fmtStamp(str){
   var m = /^([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[ T]([0-9]{2}):([0-9]{2}))?/.exec(str || '');
   if (!m) return { date: str || '', time: '' };
   var dt = new Date(+m[1], +m[2] - 1, +m[3]);
   var date = m[3] + ' ' + MONTHS[+m[2] - 1] + ' (' + DAYS[dt.getDay()] + ')';
   if (m[4] === undefined) return { date: date, time: '' };
-  return { date: date, time: m[4] + ':' + m[5] };
+  return { date: date, time: ampm(+m[4], +m[5]) };
 }
 
 var TAB = 'att';
@@ -2326,7 +2417,9 @@ function renderAtt(a){
   q('aFoot').innerHTML = 'Counting '
     + (a.verifiedBy === 'face' ? '<b>face-verified punches only</b>' : 'every verification mode')
     + '. A day reads first movement in, last movement out, and the pairs between them as breaks; '
-    + 'repeat taps at the same gate are folded into one movement.'
+    + 'repeat taps at the same gate are folded into one movement. '
+    + 'Open a day to set a punch to In or Out by hand &mdash; a marked punch is never folded '
+    + 'into its neighbour, so tapping out and straight back in reads as a break of at least a minute.'
     + (t.ignored ? ' <b>' + t.ignored + '</b> card or fingerprint punch(es) in this range were not counted.' : '');
 }
 function kpi(k, v, col){
@@ -2340,6 +2433,65 @@ var GAP = {'Break end':['Away on break','var(--warn)'],
            'Check out':['At work','var(--ok)'],
            'Break start':['At work','var(--ok)'],
            'Extra punch':['','']};
+
+// One row per tap inside the movement, each with the direction someone can
+// set by hand. A folded run gets a row per tap because the whole point is to
+// pull a tap out of it: an out and an in a second apart look identical to the
+// terminal, and only a person can say they were two different movements.
+function dirRows(e, day){
+  var taps = e.rows || [];
+  var out = '';
+  for (var j = 0; j < taps.length; j++){
+    var tp = taps[j];
+    out += '<div class="tapline"><span class="hint t">' + esc(fmtStamp(tp.t).time) + '</span>'
+      + dirSeg(tp.k, tp.m, day) + '</div>';
+  }
+  return out;
+}
+function dirSeg(key, mark, day){
+  var b = function(v, txt, cls){
+    return '<button data-k="' + esc(key) + '" data-d="' + v + '" data-day="' + day + '"'
+      + ' class="' + (mark === v ? 'on ' + cls : '') + '">' + txt + '</button>';
+  };
+  return '<span class="dir">' + b('in', 'In', 'in') + b('out', 'Out', 'out')
+    + b('', 'Auto', 'auto') + '</span>';
+}
+// A run of taps that the model folded into one movement is, when it sits in
+// the middle of a day, usually a departure and a return read as one: that is
+// the "Extra punch" that counts for nothing. Marking its first tap out and its
+// last tap in splits it back into the break it was, in one press. The taps
+// between stay unmarked and keep folding into the departure, so a four-tap run
+// becomes a break start and a break end, not four movements.
+function splitBreak(day, idx){
+  var e = ATT.days[day].events[idx], r = e.rows || [];
+  if (r.length < 2) return toast('Only one tap here, so there is nothing to split.', 'bad');
+  setDir([{key: r[0].k, dir: 'out'}, {key: r[r.length-1].k, dir: 'in'}], null, day);
+}
+// Marking a punch re-splits the day, so pull the range again rather than
+// guessing at the new shape, then redraw the timeline that is still open.
+function setDir(key, dir, day){
+  var marks = Array.isArray(key) ? key : [{key: key, dir: dir}];
+  fetch('/api/punch/dir', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({marks: marks})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok) throw new Error(j.error || 'failed');
+      var pin = q('aUser').value;
+      if (!pin) throw new Error('no employee selected');
+      var p = new URLSearchParams({from:q('aFrom').value, to:q('aTo').value,
+                                   face:FACE, pin:pin});
+      return fetch('/api/attendance?' + p.toString()).then(function(r){ return r.json(); });
+    })
+    .then(function(a){ renderAtt(a); openDay(day); })
+    .catch(function(err){ toast('Could not set the direction: ' + err.message, 'bad'); });
+}
+document.addEventListener('click', function(e){
+  if (!e.target.closest) return;
+  var b = e.target.closest('.dir button');
+  if (b) return setDir(b.dataset.k, b.dataset.d, Number(b.dataset.day));
+  var sp = e.target.closest('.tl .split');
+  if (sp) return splitBreak(Number(sp.dataset.day), Number(sp.dataset.ev));
+});
 
 function openDay(i){
   var d = ATT.days[i];
@@ -2370,10 +2522,13 @@ function openDay(i){
       html += '<div class="ev ' + (STEP[e.label] || 'x') + '">'
         + '<div><b>' + esc(e.label) + '</b> <span class="t" style="color:var(--dim)">'
         + esc(f.time) + '</span>'
-        + (e.taps > 1 ? ' <span class="tag">' + e.taps + ' taps, first ' + esc(fmtStamp(e.from).time) + '</span>' : '')
+        + (e.taps > 1 ? ' <span class="tag">' + e.taps + ' taps, first ' + esc(fmtStamp(e.from).time) + '</span>'
+             + ' <button class="split" data-day="' + i + '" data-ev="' + k + '">Split into break</button>' : '')
+        + (e.mark ? ' <span class="tag">set by hand</span>' : '')
         + '</div>'
         + '<div class="hint">' + esc(LAB.verify[e.verify] || ('mode ' + e.verify))
-        + ' &middot; gate ' + esc(e.sn) + '</div></div>';
+        + ' &middot; gate ' + esc(e.sn) + '</div>'
+        + dirRows(e, i) + '</div>';
     }
     html += '</div>';
     if (d.events.length === 1) html += '<div class="note" style="padding:0 0 12px">'
