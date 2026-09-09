@@ -1449,6 +1449,7 @@ h1{font-size:15px}
   <div class="panel">
     <h2>Attendance log
       <span class="row">
+        <button class="p" onclick="syncData()">Sync data</button>
         <button onclick="exportCsv()">Export CSV</button>
         <button class="d" onclick="purge()">Clear history</button>
       </span>
@@ -1480,6 +1481,7 @@ h1{font-size:15px}
       </label>
       <button onclick="clearFilters()">Reset</button>
     </div>
+    <div class="body note syncMsg" style="padding-top:0"></div>
     <div class="scroll" style="max-height:620px">
       <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th></tr></thead>
       <tbody id="tbLogs"></tbody></table>
@@ -1602,13 +1604,14 @@ h1{font-size:15px}
             <button class="p" onclick="syncData()">Sync data</button>
             <button onclick="cmd('synctime')">Sync clock</button>
             <button onclick="cmd('queryuser')">Pull users</button>
+            <button onclick="cmd('queryatt',{days:1})">Pull today</button>
             <button onclick="cmd('queryatt',{days:7})">Pull 7 days</button>
             <button onclick="cmd('queryatt',{days:30})">Pull 30 days</button>
             <button onclick="cmd('info')">Device info</button>
             <button onclick="cmd('check')">Full re-sync</button>
             <button onclick="cmd('reboot')">Reboot</button>
           </div>
-          <div class="note" id="cmdMsg" style="margin-top:8px"></div>
+          <div class="note syncMsg" style="margin-top:8px"></div>
         </div>
       </div>
 
@@ -2126,16 +2129,22 @@ function doorProbe(){
 // for both: who is enrolled, then the last 30 days of punches. Already-stored
 // punches are ignored on arrival, so this is safe to press at any time.
 function syncData(){
-  var box = q('cmdMsg');
-  if (box) box.textContent = 'asking the terminals for users and the last 30 days...';
+  say('asking the terminals for users and the last 30 days...');
   Promise.all([post('queryuser', {}), post('queryatt', {days: 30})])
     .then(function(rs){
       var bad = rs.filter(function(r){ return !r.ok; });
-      if (box) box.textContent = bad.length
+      say(bad.length
         ? (bad[0].error || 'the terminals did not accept the request')
-        : 'requested - the terminals answer over the next minute or two.';
+        : 'requested - the terminals answer over the next minute or two.');
       refresh();
     });
+}
+
+// The sync can be started from Commands or from the log, so the reply goes to
+// every message holder rather than to whichever tab happens to be showing.
+function say(msg){
+  var els = document.getElementsByClassName('syncMsg');
+  for (var i = 0; i < els.length; i++) els[i].textContent = msg;
 }
 
 function post(kind, extra){
