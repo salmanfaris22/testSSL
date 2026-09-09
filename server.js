@@ -1439,11 +1439,16 @@ h1{font-size:15px}
   </div>
 
   <div class="panel">
-    <h2>Users on device</h2>
+    <h2>Users on device
+      <span class="row">
+        <input id="uq" placeholder="Filter users" style="width:170px" oninput="renderUsers()">
+        <button onclick="cmd('queryuser')">Pull from device</button>
+      </span>
+    </h2>
     <div class="scroll" style="max-height:300px">
       <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
       <tbody id="tbUsers"></tbody></table>
-      <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull users</b> on the Devices tab.</div>
+      <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull from device</b>.</div>
     </div>
   </div>
 </section>
@@ -1548,6 +1553,7 @@ h1{font-size:15px}
             <button onclick="cmd('synctime')">Sync clock</button>
             <button onclick="cmd('queryuser')">Pull users</button>
             <button onclick="cmd('queryatt',{days:7})">Pull 7 days</button>
+            <button onclick="cmd('queryatt',{days:30})">Pull 30 days</button>
             <button onclick="cmd('info')">Device info</button>
             <button onclick="cmd('check')">Full re-sync</button>
             <button onclick="cmd('reboot')">Reboot</button>
@@ -1796,6 +1802,31 @@ function refresh(){
 // Newest first, so following means staying pinned to the top. With follow off
 // the scroll position is held across refreshes, which is what makes reading
 // back through a trace on a live server possible at all.
+var PRIVILEGE = {'0':'User','2':'Enroller','6':'Manager','14':'Super admin'};
+
+// Drawn from PEOPLE rather than from the response, so typing in the filter
+// redraws the list without waiting for the next poll.
+function renderUsers(){
+  var term = (q('uq').value || '').toLowerCase();
+  var list = PEOPLE || [];
+  if (term) list = list.filter(function(u){
+    return String(u.pin).toLowerCase().indexOf(term) >= 0
+      || String(u.name || '').toLowerCase().indexOf(term) >= 0;
+  });
+  q('tbUsers').innerHTML = list.map(function(u){
+    var bio = u.bio ? Object.keys(u.bio).join(', ') : '';
+    return '<tr><td class="mono">' + esc(u.pin) + '</td><td>' + esc(u.name) + '</td>'
+      + '<td class="mono">' + esc(u.card || '') + '</td>'
+      + '<td>' + esc(PRIVILEGE[u.privilege] || u.privilege || 'User') + '</td>'
+      + '<td style="color:#8b949e">' + esc(bio) + '</td></tr>';
+  }).join('');
+  var empty = q('emptyUsers');
+  empty.style.display = list.length ? 'none' : 'block';
+  empty.innerHTML = (PEOPLE || []).length
+    ? 'No user matches that filter.'
+    : 'No users synced yet &mdash; press <b>Pull from device</b>.';
+}
+
 function renderTrace(){
   var box = q('trace');
   if (!box) return;
@@ -1846,7 +1877,10 @@ function render(s){
       var i = d.info || {};
       return '<div style="margin-bottom:12px">'
         + '<div class="row" style="justify-content:space-between"><b class="mono">' + esc(d.sn) + '</b>'
-        + '<span class="badge ' + (d.online?'on':'off') + '">' + (d.online?'online':'offline') + '</span></div>'
+        + '<span class="row"><span class="badge ' + (d.online?'on':'off') + '">'
+        + (d.online?'online':'offline') + '</span>'
+        + '<button onclick="cmd(&quot;info&quot;,' + esc(JSON.stringify({sn:d.sn})) + ')">Refresh info</button>'
+        + '</span></div>'
         + '<div class="hint" style="margin-top:6px">'
         + 'IP <b>' + esc(d.ip||'?') + '</b><br>'
         + 'Model <b>' + esc((i.DeviceName || i['~DeviceName'] || 'AIFACE-MARS').split(',')[0]) + '</b>'
@@ -1898,17 +1932,7 @@ function render(s){
   }
 
   // users
-  var ub = '';
-  for (var j = 0; j < s.users.length; j++) {
-    var u = s.users[j];
-    var bio = u.bio ? Object.keys(u.bio).join(', ') : '';
-    var pri = {'0':'User','2':'Enroller','6':'Manager','14':'Super admin'}[u.privilege] || u.privilege || 'User';
-    ub += '<tr><td class="mono">' + esc(u.pin) + '</td><td>' + esc(u.name) + '</td>'
-       + '<td class="mono">' + esc(u.card || '') + '</td><td>' + esc(pri) + '</td>'
-       + '<td style="color:#8b949e">' + esc(bio) + '</td></tr>';
-  }
-  q('tbUsers').innerHTML = ub;
-  q('emptyUsers').style.display = s.users.length ? 'none' : 'block';
+  renderUsers();
 
   // trace
   EVENTS = s.events;
