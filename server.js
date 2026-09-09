@@ -10,6 +10,11 @@
  */
 'use strict';
 
+// The terminals send naive local timestamps in Indian time, so the process is
+// pinned to the same zone. Without this a UTC host (Render) groups punches
+// into the wrong day between 00:00 and 05:30 IST. Override with APP_TZ.
+process.env.TZ = process.env.APP_TZ || 'Asia/Kolkata';
+
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
@@ -21,16 +26,118 @@ const DATA_DIR = path.join(__dirname, 'data');
 const ATT_FILE = path.join(DATA_DIR, 'attlog.jsonl');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
-const STARTED = Date.now();
+const SET_FILE = path.join(DATA_DIR, 'settings.json');
+const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
+// The terminals stamp punches with their own clock, which is rarely Indian
+// time: one left on UTC is 330 min behind, one set to GMT+5:00 is 30 min
+// behind. Shift on ingest so everything downstream (day grouping, filters,
+// exports) works in Indian time. Set DEVICE_OFFSET_MIN to pin it by hand.
+const FORCED_OFFSET = process.env.DEVICE_OFFSET_MIN === undefined
+  ? null : Number(process.env.DEVICE_OFFSET_MIN);
+// A live punch arrives as its own tiny push; anything bigger is a backlog dump.
+const LIVE_BATCH_ROWS = 3;
+const MAX_OFFSET_MIN = 14 * 60;   // beyond any real timezone, so: a stale dump
 
-// A device is declared offline once it misses roughly three of its own polls.
-// The device picks the interval (Delay= in the handshake), so measure it
-// instead of assuming: a terminal on a slow link polls far less often.
-const MIN_OFFLINE_MS = 75000;
-const MAX_OFFLINE_MS = 10 * 60000;
-const MAX_BODY = 16 * 1024 * 1024;   // a full BIODATA push can be large
-const BODY_TIMEOUT_MS = 45000;
-const MAX_LOGS_IN_MEMORY = 200000;
+// The gap between a punch's stamp and its arrival is the terminal's clock error
+// at that moment - but only for a punch pushed live. Clock and timezone
+// mistakes always land on a quarter hour, so round the gap to the nearest
+// 15 min and take it only when what is left over is plausible upload latency;
+// a backlog row is stale by an arbitrary amount and yields nothing.
+function liveOffset(devTime, at) {
+  const parsed = Date.parse(String(devTime).replace(' ', 'T'));
+  if (!parsed) return null;
+  const gap = (at - parsed) / 60000;
+  const off = Math.round(gap / 15) * 15;
+  if (Math.abs(gap - off) > 5 || Math.abs(off) > MAX_OFFSET_MIN) return null;
+  return off;
+}
+
+// Backlog dumps arrive many rows at a time and would poison the measurement,
+// so only live-sized batches are measured; a dump reuses whatever the device
+// last reported.
+function detectClockOffset(sn, devTime, rows) {
+  if (FORCED_OFFSET !== null) return FORCED_OFFSET;
+  const d = state.devices[sn];
+  const known = (d && d.clockOffset) || 0;
+  if (!d || rows > LIVE_BATCH_ROWS) return known;
+  const off = liveOffset(devTime, Date.now());
+  if (off === null) return known;
+  if (off === known) return known;
+  d.clockOffset = off;
+  trace('info', sn, 'clock offset now ' + off + ' min (was ' + known + ')');
+  restampDevice(sn);
+  saveSoon();
+  return off;
+}
+
+// A stored time is only the device stamp plus the clock error, so punches
+// recorded under a wrong offset can be re-derived instead of staying wrong
+// forever. Each one is re-derived from its own arrival gap rather than from the
+// offset measured now, so that a terminal whose clock is genuinely re-set does
+// not drag older, correctly stamped history along with it. Punches with no
+// devTime, or that came in a backlog dump, carry no such evidence and are left
+// exactly as they are.
+function restampDevice(sn) {
+  let changed = 0;
+  for (const r of state.logs) {
+    if (r.sn !== sn || !r.devTime || !r.recv) continue;
+    const off = liveOffset(r.devTime, r.recv);
+    if (off === null) continue;
+    const t = shiftStamp(r.devTime, off);
+    if (t !== r.time) { r.time = t; changed++; }
+  }
+  if (!changed) return;
+  rewriteAttlog(sn);
+  trace('info', sn, 'restamped ' + changed + ' past punch(es)');
+}
+
+// Times are the dedupe key, so the key set is rebuilt with the file.
+function rewriteAttlog(sn) {
+  seen.clear();
+  for (const r of state.logs) seen.add(punchKey(r));
+  try {
+    fs.writeFileSync(ATT_FILE, state.logs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  } catch (e) { trace('err', sn || '-', 'attlog rewrite: ' + e.message); }
+}
+
+// Punches recorded before the device stamp was kept alongside the corrected one
+// hold the raw terminal stamp in `time` - unshifted, so hours away from Indian
+// time whenever the terminal's own clock was not set to it. When they arrived
+// is still on record, so the measurement used for a live punch recovers them:
+// adopt the stamp as devTime and re-derive the time from the arrival gap.
+// Anything that cannot be measured keeps the stamp it was found with.
+function backfillDevTime() {
+  let changed = 0;
+  let filled = 0;
+  for (const r of state.logs) {
+    if (r.devTime || !r.recv) continue;
+    r.devTime = r.time;
+    filled++;
+    const off = liveOffset(r.devTime, r.recv);
+    if (off === null) continue;
+    const t = shiftStamp(r.devTime, off);
+    if (t !== r.time) { r.time = t; changed++; }
+  }
+  if (!filled) return;
+  rewriteAttlog();
+  trace('info', '-', 'recovered device stamps for ' + filled + ' old punch(es), '
+    + changed + ' corrected to Indian time');
+}
+
+function punchKey(r) {
+  return r.sn + '|' + r.pin + '|' + r.time + '|' + r.status;
+}
+
+function shiftStamp(t, mins) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(t || '');
+  if (!m || !mins) return t;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+  d.setUTCMinutes(d.getUTCMinutes() + mins);
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+const ROLE_IN = snList(process.env.IN_SN);
+const ROLE_OUT = snList(process.env.OUT_SN);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -42,97 +149,58 @@ const state = {
   logs: [],      // attendance punches
   queue: {},     // sn -> pending command objects
   events: [],    // raw protocol trace
+  // allowIps: HR API allow-list, empty = denied. faceOnly: attendance counts
+  // face-verified punches only. dwellSec: gate re-tap window, see below.
+  settings: { allowIps: [], faceOnly: undefined, dwellSec: undefined, doorPin: '' },
 };
 const seen = new Set();          // dedupe key for punches
 let cmdSeq = Date.now() % 100000;
-const startupWarnings = [];
-
-/* ------------------------------------------------------------ persistence */
-
-// Rename is atomic on every platform we care about, so a crash or a Ctrl-C
-// mid-save can never leave a half-written JSON file behind. The old code
-// wrote in place: an interrupted write produced invalid JSON, loadState threw,
-// and every user and device silently vanished on the next start.
-function writeJsonAtomic(file, obj) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
-  fs.renameSync(tmp, file);
-}
-
-function readJsonSafe(file, label) {
-  let raw;
-  try { raw = fs.readFileSync(file, 'utf8'); }
-  catch (e) { return {}; }                       // first run
-  try { return JSON.parse(raw); }
-  catch (e) {
-    // Keep the damaged file instead of overwriting it, and say so loudly.
-    const bak = file + '.corrupt-' + Date.now();
-    try { fs.writeFileSync(bak, raw); } catch (e2) {}
-    const msg = label + ' was corrupt and could not be read (' + e.message
-      + '). A copy is at ' + path.basename(bak) + '; starting with an empty set.';
-    startupWarnings.push(msg);
-    console.error('  !! ' + msg);
-    return {};
-  }
-}
 
 function loadState() {
-  let bad = 0;
   try {
     for (const line of fs.readFileSync(ATT_FILE, 'utf8').split('\n')) {
       if (!line.trim()) continue;
-      let r;
-      try { r = JSON.parse(line); } catch (e) { bad++; continue; }
-      if (!r || !r.sn || !r.time) { bad++; continue; }
-      r.pin = String(r.pin == null ? '' : r.pin);
+      const r = JSON.parse(line);
       state.logs.push(r);
-      seen.add(punchKey(r.sn, r.pin, r.time, r.status));
+      seen.add(punchKey(r));
     }
   } catch (e) { /* first run */ }
-  if (bad) startupWarnings.push(bad + ' unreadable line(s) in attlog.jsonl were skipped.');
-
-  state.users = readJsonSafe(USERS_FILE, 'data/users.json');
-  state.devices = readJsonSafe(DEV_FILE, 'data/devices.json');
-  for (const sn of Object.keys(state.devices)) {
-    state.devices[sn] = normalizeDevice(sn, state.devices[sn]);
-  }
+  try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
+  try { Object.assign(state.settings, JSON.parse(fs.readFileSync(SET_FILE, 'utf8'))); } catch (e) {}
+  try {
+    state.devices = JSON.parse(fs.readFileSync(DEV_FILE, 'utf8'));
+    for (const sn of Object.keys(state.devices)) {
+      const d = state.devices[sn];
+      d.online = false;
+      if (ROLE_IN.includes(sn)) d.role = 'in';
+      else if (ROLE_OUT.includes(sn)) d.role = 'out';
+      // the old parser stuffed the whole comma-separated INFO line into one
+      // key; re-split it so Firmware / Faces / Users / Logs resolve
+      for (const [k, v] of Object.entries(d.info || {})) {
+        if (typeof v === 'string' && v.includes('=') && v.includes(',')) {
+          delete d.info[k];
+          for (const part of (k + '=' + v).split(',')) {
+            const i = part.indexOf('=');
+            if (i > 0) d.info[part.slice(0, i).trim().replace(/^~/, '')] = part.slice(i + 1).trim();
+          }
+        }
+      }
+    }
+  } catch (e) {}
 }
 
 let saveTimer = null;
-let dirty = false;
-
-// Marks state as needing a write. The old version wrote users.json AND
-// devices.json on every single device poll (~every 10s, forever) even when
-// nothing had changed; now a write only happens after a real change.
 function saveSoon() {
-  dirty = true;
   if (saveTimer) return;
-  saveTimer = setTimeout(flushState, 1500);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      fs.writeFileSync(USERS_FILE, JSON.stringify(state.users, null, 2));
+      fs.writeFileSync(DEV_FILE, JSON.stringify(state.devices, null, 2));
+      fs.writeFileSync(SET_FILE, JSON.stringify(state.settings, null, 2));
+    } catch (e) { console.error('save failed', e.message); }
+  }, 800);
 }
-
-function flushState() {
-  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-  if (!dirty) return;
-  dirty = false;
-  try {
-    writeJsonAtomic(USERS_FILE, state.users);
-    writeJsonAtomic(DEV_FILE, state.devices);
-  } catch (e) {
-    dirty = true;
-    console.error('save failed', e.message);
-  }
-}
-
-// lastSeen and the poll counters change on every heartbeat. Flushing those on
-// each one would hammer the disk, so they ride a slow timer instead - and an
-// idle server with no traffic still writes nothing at all.
-let countersDirty = false;
-setInterval(() => {
-  if (!countersDirty) return;
-  countersDirty = false;
-  dirty = true;
-  flushState();
-}, 60000).unref();
 
 function trace(kind, sn, msg) {
   state.events.push({ t: Date.now(), kind, sn: sn || '-', msg: String(msg).slice(0, 400) });
@@ -143,100 +211,79 @@ function trace(kind, sn, msg) {
 
 /* ----------------------------------------------------------- device model */
 
-function normalizeDevice(sn, d) {
-  const base = {
-    sn, name: '', ip: '', firstSeen: Date.now(), lastSeen: 0, lastPoll: 0,
-    pushCount: 0, info: {}, stamp: '9999', opStamp: '9999', online: false,
-    polls: 0, pollInterval: 0, sessions: 0, drops: 0, lastDrop: 0,
-    lastCmd: 0, cmdsSent: 0, cmdsDone: 0, lastPush: 0, lastError: '',
-  };
-  const out = Object.assign(base, d || {}, { sn });
-  out.online = false;                       // nothing is online until it polls
-  out.info = out.info && typeof out.info === 'object' ? out.info : {};
-
-  // Repair records written by the old broken options parser, which stuffed the
-  // entire comma-separated option list into a single "DeviceName" value.
-  for (const k of Object.keys(out.info)) {
-    const v = out.info[k];
-    if (typeof v === 'string' && v.length > 80 && /,[~A-Za-z_][\w~.\-]*=/.test(v)) {
-      delete out.info[k];
-      applyOptions(out, k + '=' + v);
-    }
-  }
-  if (typeof out.name === 'string' && out.name.length > 80) out.name = '';
-  if (!out.name) out.name = out.info.DeviceName || out.info['~DeviceName'] || '';
-  return out;
-}
-
-function touchDevice(sn, req, kind) {
+function touchDevice(sn, req) {
   if (!sn) return null;
   let d = state.devices[sn];
   if (!d) {
-    d = state.devices[sn] = normalizeDevice(sn, null);
-    d.lastSeen = 0;
+    d = state.devices[sn] = {
+      sn, name: '', ip: '', firstSeen: Date.now(), lastSeen: 0,
+      pushCount: 0, info: {}, stamp: '9999', opStamp: '9999', online: false,
+      role: ROLE_IN.includes(sn) ? 'in' : (ROLE_OUT.includes(sn) ? 'out' : ''),
+    };
     trace('info', sn, 'new device registered');
-    saveSoon();
   }
-  const now = Date.now();
-  if (!d.online) {
-    d.online = true;
-    d.onlineSince = now;
-    d.sessions = (d.sessions || 0) + 1;
-    trace('info', sn, 'device is online');
-    saveSoon();
-  }
-  d.lastSeen = now;
-  countersDirty = true;
-
-  if (kind === 'poll') {
-    // Learn the device's real poll cadence so the offline check can adapt to
-    // it rather than to a hardcoded 90 seconds.
-    if (d.lastPoll) {
-      const gap = now - d.lastPoll;
-      if (gap > 500 && gap < 15 * 60000) {
-        d.pollInterval = d.pollInterval ? Math.round(d.pollInterval * 0.7 + gap * 0.3) : gap;
-      }
-    }
-    d.lastPoll = now;
-    d.polls = (d.polls || 0) + 1;
-  }
-
+  d.lastSeen = Date.now();
+  d.online = true;
   if (req) {
     const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-    if (ip && ip !== d.ip) { d.ip = ip; saveSoon(); }
+    if (ip) d.ip = ip;
   }
+  saveSoon();
   return d;
-}
-
-function offlineAfter(d) {
-  const iv = d.pollInterval || 10000;
-  return Math.min(MAX_OFFLINE_MS, Math.max(MIN_OFFLINE_MS, iv * 3 + 15000));
 }
 
 setInterval(() => {
   const now = Date.now();
   for (const d of Object.values(state.devices)) {
-    if (d.online && now - d.lastSeen > offlineAfter(d)) {
+    if (d.online && now - d.lastSeen > 90000) {
       d.online = false;
-      d.drops = (d.drops || 0) + 1;
-      d.lastDrop = now;
-      trace('err', d.sn, 'went offline (silent for '
-        + Math.round((now - d.lastSeen) / 1000) + 's)');
-      saveSoon();
+      trace('info', d.sn, 'went offline (no poll for 90s)');
     }
   }
-}, 10000).unref();
+}, 15000);
 
 /* --------------------------------------------------------------- commands */
 
-function enqueue(sn, cmd) {
+function enqueue(sn, cmd, meta) {
   const id = ++cmdSeq;
-  const item = { id, sn, cmd, created: Date.now(), sent: 0, returned: 0, result: null };
-  const q = (state.queue[sn] = state.queue[sn] || []);
-  q.push(item);
-  if (q.length > 200) q.splice(0, q.length - 200);
+  const item = Object.assign(
+    { id, sn, cmd, created: Date.now(), sent: 0, returned: 0, result: null }, meta || {});
+  (state.queue[sn] = state.queue[sn] || []).push(item);
+  // the queue is display-only state; trimming keeps a long-running server flat
+  const q = state.queue[sn];
+  if (q.length > 200) {
+    const cut = q.length - 200;
+    // keep anything still awaiting a reply, however old
+    const keep = q.slice(0, cut).filter((c) => !c.returned);
+    q.splice(0, cut, ...keep);
+  }
   trace('info', sn, 'queued C:' + id + ':' + cmd);
   return item;
+}
+
+// Opening the door is the one command whose wording differs between firmware
+// families: the access-control builds take AC_UNLOCK, the standalone terminal
+// builds (ZAM platform, PushVersion 3.x) take CONTROL DEVICE. Nothing in the
+// handshake tells us which we are talking to, so we try them in order and
+// remember the one the terminal accepted - after the first success a device
+// only ever receives its own working form.
+// These are candidates, not a spec we can look up per device: the handshake
+// does not say which family this firmware belongs to, so we try each in turn
+// and keep the one the terminal answers Return=0 to. "Try every unlock form"
+// in the dashboard fires all of them and reports each reply, which is how you
+// find out whether the terminal accepts any of them at all.
+const UNLOCK_SEC = Number(process.env.UNLOCK_SEC) || 5;
+const UNLOCK_FORMS = [
+  'AC_UNLOCK',
+  'AC_UNLOCK 1',
+  'CONTROL DEVICE 01 1 1 ' + UNLOCK_SEC + ' 0',
+  'CONTROL DEVICE 01 000 0 0 0',
+];
+
+function unlockCommand(sn, variant) {
+  const d = state.devices[sn];
+  if (variant === undefined && d && d.unlockCmd) return d.unlockCmd;
+  return UNLOCK_FORMS[Math.min(variant || 0, UNLOCK_FORMS.length - 1)];
 }
 
 // ZK encoded date-time integer used by SET OPTION DateTime=
@@ -251,13 +298,11 @@ function buildCommand(kind, p) {
   const fmt = (d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
     + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   switch (kind) {
-    case 'unlock':   return 'AC_UNLOCK';
+    case 'unlock':   return unlockCommand(p.sn, p.variant);
     case 'reboot':   return 'REBOOT';
     case 'info':     return 'INFO';
     case 'check':    return 'CHECK';                       // force full re-sync from device
     case 'synctime': return 'SET OPTION DateTime=' + zkTime(new Date());
-    case 'clearlog': return 'CLEAR LOG';
-    case 'cleardata':return 'CLEAR DATA';
     case 'queryuser':return 'DATA QUERY USERINFO PIN=' + (p.pin || '*');
     case 'queryatt': {
       const end = new Date();
@@ -285,29 +330,25 @@ const STATUS = {
   4: 'OT-In', 5: 'OT-Out', 255: 'Punch',
 };
 
-function punchKey(sn, pin, time, status) {
-  return sn + '|' + pin + '|' + time + '|' + (Number(status) || 0);
-}
-
-function addPunch(sn, pin, time, status, verify, workcode, extra) {
-  const key = punchKey(sn, pin, time, status);
+function addPunch(sn, pin, devTime, status, verify, workcode, extra, offset) {
+  const time = shiftStamp(devTime, offset);
+  const key = punchKey({ sn, pin: String(pin), time, status: Number(status) || 0 });
   if (seen.has(key)) return false;
   seen.add(key);
   const rec = {
-    sn, pin: String(pin), time, status: Number(status) || 0,
+    sn, pin: String(pin), time, devTime, status: Number(status) || 0,
     verify: Number(verify) || 0, workcode: workcode || '0',
     name: (state.users[pin] && state.users[pin].name) || '',
     recv: Date.now(), extra: extra || '',
   };
   state.logs.push(rec);
-  if (state.logs.length > MAX_LOGS_IN_MEMORY) state.logs.splice(0, 1000);
   try { fs.appendFileSync(ATT_FILE, JSON.stringify(rec) + '\n'); }
   catch (e) { trace('err', sn, 'attlog write: ' + e.message); }
   return true;
 }
 
 function parseAttlog(sn, body) {
-  let n = 0, dup = 0;
+  const rows = [];
   for (const raw of body.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
@@ -316,12 +357,20 @@ function parseAttlog(sn, body) {
     const pin = f[0].trim();
     const time = (f[1] || '').trim();
     if (!pin || !/\d{4}-\d{2}-\d{2}/.test(time)) continue;
-    if (addPunch(sn, pin, time, f[2], f[3], f[4], f.slice(5).join('|'))) n++; else dup++;
+    rows.push({ pin, time, f });
+  }
+  // one measurement for the batch, taken from its newest stamp - that is the
+  // punch that just happened, the rest may be minutes older
+  const newest = rows.reduce((a, r) => (r.time > a ? r.time : a), '');
+  const off = detectClockOffset(sn, newest, rows.length);
+  let n = 0;
+  for (const r of rows) {
+    const f = r.f;
+    if (addPunch(sn, r.pin, r.time, f[2], f[3], f[4], f.slice(5).join('|'), off)) n++;
   }
   const d = state.devices[sn];
-  if (d) { d.pushCount = (d.pushCount || 0) + n; d.lastPush = Date.now(); }
-  trace('dev', sn, 'ATTLOG -> ' + n + ' new punch(es)' + (dup ? ', ' + dup + ' duplicate' : ''));
-  if (n) saveSoon();
+  if (d) d.pushCount = (d.pushCount || 0) + n;
+  trace('dev', sn, 'ATTLOG -> ' + n + ' new punch(es)');
   return n;
 }
 
@@ -366,95 +415,39 @@ function parseOperlog(sn, body) {
   return users;
 }
 
-// The terminal sends its option list either one-per-line or, on most ESSL
-// firmware, as a single long comma-separated line. Splitting on newlines alone
-// collapsed all 50-odd options into one bogus value, which is why the device
-// panel showed "?" for firmware, user count and face count.
-// Only split at a comma that is followed by another "key=" token, so a value
-// containing a comma survives intact.
-const OPT_SPLIT = /,(?=~?[A-Za-z_][A-Za-z0-9_~.\-]*=)/g;
-
-function optionParts(body) {
-  const out = [];
-  for (const line of String(body).split(/\r?\n/)) {
-    const s = line.trim();
-    if (!s) continue;
-    let start = 0, m;
-    OPT_SPLIT.lastIndex = 0;
-    while ((m = OPT_SPLIT.exec(s))) {
-      out.push(s.slice(start, m.index));
-      start = m.index + 1;
-    }
-    out.push(s.slice(start));
-  }
-  return out;
-}
-
-function applyOptions(d, body) {
-  let n = 0;
-  for (const part of optionParts(body)) {
-    const s = part.trim().replace(/^~/, '');
-    if (!s) continue;
-    const i = s.indexOf('=');
-    if (i <= 0) continue;
-    d.info[s.slice(0, i).trim()] = s.slice(i + 1).trim();
-    n++;
-  }
-  return n;
-}
-
 function parseOptions(sn, body) {
   const d = touchDevice(sn);
   if (!d) return;
-  const n = applyOptions(d, body);
-  d.name = d.info.DeviceName || d.name;
+  // firmware sends INFO as one comma-separated line: "MAC=..,UserCount=81,.."
+  for (const raw of body.split(/[\r\n,]+/)) {
+    const line = raw.trim().replace(/^~/, '');
+    if (!line) continue;
+    const i = line.indexOf('=');
+    if (i > 0) d.info[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  d.name = d.info.DeviceName || d.info['~DeviceName'] || d.name;
   saveSoon();
-  trace('dev', sn, 'options: ' + n + ' field(s), fw ' + (d.info.FWVersion || '?')
-    + ' ' + (d.info.DeviceName || ''));
+  trace('dev', sn, 'options: ' + (d.info.FWVersion || '') + ' ' + (d.info.DeviceName || ''));
 }
 
 /* -------------------------------------------------------- http utilities */
 
-// Resolves on 'end', and also on abort, error or timeout. The old version only
-// listened for 'end' and 'error', so a terminal that dropped the connection
-// mid-upload left this promise pending forever: the request handler never
-// returned, the socket was never closed, and the device sat waiting for a
-// reply it would never get. That is the "sometimes it just does not connect".
 function readBody(req) {
   return new Promise((resolve) => {
     const chunks = [];
-    let size = 0, done = false;
-    const finish = (why) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      if (why) trace('err', '', 'request body ' + why + ' after ' + size + ' bytes');
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
       let buf = Buffer.concat(chunks);
       if (buf.length > 1 && buf[0] === 0x1f && buf[1] === 0x8b) {
         try { buf = zlib.gunzipSync(buf); } catch (e) {}
       }
       resolve(buf.toString('utf8'));
-    };
-    const timer = setTimeout(() => { finish('timed out'); try { req.destroy(); } catch (e) {} },
-      BODY_TIMEOUT_MS);
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > MAX_BODY) { finish('too large'); try { req.destroy(); } catch (e) {} return; }
-      chunks.push(c);
     });
-    req.on('end', () => finish(''));
-    req.on('aborted', () => finish('aborted'));
-    req.on('close', () => finish(''));
-    req.on('error', () => finish('errored'));
+    req.on('error', () => resolve(''));
   });
 }
 
-function deadRes(res) {
-  return res.writableEnded || res.destroyed || (res.socket && res.socket.destroyed);
-}
-
 function textOut(res, body, code) {
-  if (deadRes(res)) return;
   const b = Buffer.from(String(body), 'utf8');
   res.writeHead(code || 200, {
     'Content-Type': 'text/plain; charset=utf-8',
@@ -466,12 +459,10 @@ function textOut(res, body, code) {
 }
 
 function jsonOut(res, obj, code) {
-  if (deadRes(res)) return;
   const b = Buffer.from(JSON.stringify(obj), 'utf8');
   res.writeHead(code || 200, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': b.length,
-    'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
   });
   res.end(b);
@@ -489,17 +480,9 @@ function lanIPs() {
 
 /* ------------------------------------------------- device push protocol */
 
-// Firmware differs on capitalisation, so look a parameter up case-insensitively
-// rather than guessing which two spellings to try.
-function param(q, name) {
-  const want = name.toLowerCase();
-  for (const [k, v] of q) if (k.toLowerCase() === want) return v;
-  return null;
-}
-
 function handshake(sn) {
   const d = touchDevice(sn);
-  const off = -new Date().getTimezoneOffset() / 60;
+  const off = 5.5;
   return [
     'GET OPTION FROM: ' + sn,
     'ATTLOGStamp=' + (d ? d.stamp : '9999'),
@@ -514,7 +497,7 @@ function handshake(sn) {
     'TimeZone=' + off,
     'Realtime=1',
     'Encrypt=0',
-    'ServerVer=2.4.1 ' + new Date().toISOString().slice(0, 10),
+    'ServerVer=2.4.1 ' + localDate(new Date()),
     'PushProtVer=2.4.1',
     'MultiBioDataSupport=0:1:0:0:0:0:0:0:1:0',
     'MultiBioPhotoSupport=0:0:0:0:0:0:0:0:1:0',
@@ -523,13 +506,9 @@ function handshake(sn) {
 }
 
 async function handleDevice(req, res, route, q) {
-  const sn = param(q, 'SN') || '';
+  const sn = q.get('SN') || q.get('sn') || '';
 
-  if (!sn && route !== '/iclock/registry') {
-    trace('err', '', 'device request without SN: ' + req.url.slice(0, 120));
-  }
-
-  if (route === '/iclock/ping') { touchDevice(sn, req, 'poll'); return textOut(res, 'OK'); }
+  if (route === '/iclock/ping') { touchDevice(sn, req); return textOut(res, 'OK'); }
 
   if (route === '/iclock/registry') {
     await readBody(req);
@@ -550,17 +529,15 @@ async function handleDevice(req, res, route, q) {
   if (route === '/iclock/cdata' && req.method === 'POST') {
     const d = touchDevice(sn, req);
     const body = await readBody(req);
-    const table = (param(q, 'table') || '').toUpperCase();
-    const stamp = param(q, 'Stamp');
+    const table = (q.get('table') || q.get('Table') || '').toUpperCase();
+    const stamp = q.get('Stamp') || q.get('stamp');
     if (table === 'ATTLOG') {
-      // Acknowledging the stamp is what stops the terminal from re-sending its
-      // whole buffer on the next connect. Never let it move backwards.
-      if (stamp && d && stampNewer(stamp, d.stamp)) { d.stamp = stamp; saveSoon(); }
+      if (stamp && d) d.stamp = stamp;
       const n = parseAttlog(sn, body);
       return textOut(res, 'OK: ' + n);
     }
     if (table === 'OPERLOG' || table === 'USERINFO' || table === 'BIODATA') {
-      if (stamp && d && stampNewer(stamp, d.opStamp)) { d.opStamp = stamp; saveSoon(); }
+      if (stamp && d) d.opStamp = stamp;
       const n = parseOperlog(sn, body);
       return textOut(res, 'OK: ' + n);
     }
@@ -573,17 +550,17 @@ async function handleDevice(req, res, route, q) {
   }
 
   if (route === '/iclock/getrequest') {
-    const d = touchDevice(sn, req, 'poll');
+    const d = touchDevice(sn, req);
     const pending = (state.queue[sn] || []).filter((c) => !c.sent);
     if (!pending.length) return textOut(res, 'OK');
     const lines = pending.map((c) => { c.sent = Date.now(); return 'C:' + c.id + ':' + c.cmd; });
     trace('srv', sn, 'sending ' + lines.length + ' command(s)');
-    if (d) { d.lastCmd = Date.now(); d.cmdsSent = (d.cmdsSent || 0) + lines.length; }
+    if (d) d.lastCmd = Date.now();
     return textOut(res, lines.join('\n') + '\n');
   }
 
   if (route === '/iclock/devicecmd') {
-    const d = touchDevice(sn, req);
+    touchDevice(sn, req);
     const body = await readBody(req);
     for (const raw of body.split(/\r?\n|&(?=ID=)/)) {
       const line = raw.trim();
@@ -594,8 +571,19 @@ async function handleDevice(req, res, route, q) {
       if (item) {
         item.returned = Date.now();
         item.result = p.get('Return');
-        if (d) d.cmdsDone = (d.cmdsDone || 0) + 1;
         trace('dev', sn, 'cmd ' + id + ' (' + item.cmd.split(' ')[0] + ') returned ' + item.result);
+        if (item.kind === 'unlock') onUnlockReply(sn, item);
+        else if (item.kind === 'unlock-probe') {
+          item.ok = returnedOk(item);
+          // learning which wording works is the whole point of the test, so
+          // keep it for the next real press
+          const dev = state.devices[sn];
+          if (item.ok && dev && dev.unlockCmd !== item.cmd) {
+            dev.unlockCmd = item.cmd;
+            trace('info', sn, 'unlock form learned from test: ' + item.cmd);
+            saveSoon();
+          }
+        }
       } else {
         trace('dev', sn, 'devicecmd: ' + line.slice(0, 120));
       }
@@ -610,22 +598,259 @@ async function handleDevice(req, res, route, q) {
   return textOut(res, 'OK');
 }
 
-// Stamps are numeric strings, but firmware occasionally sends "None" or junk.
-function stampNewer(next, cur) {
-  const a = Number(next), b = Number(cur);
-  if (!isFinite(a)) return false;
-  if (!isFinite(b)) return true;
-  return a >= b || b === 9999;
+// Return=0 is the firmware's "done". Anything else means this build does not
+// know the wording, so we move on to the next form and let the operator see
+// only the final outcome.
+// A reply only counts as acceptance when the terminal actually sent Return=0.
+// Number(null) is 0, so a missing field must not read as success.
+function returnedOk(item) {
+  return item.result !== null && item.result !== undefined && String(item.result).trim() !== ''
+    && Number(item.result) === 0;
+}
+
+function onUnlockReply(sn, item) {
+  const d = state.devices[sn];
+  if (returnedOk(item)) {
+    item.ok = true;
+    if (d && d.unlockCmd !== item.cmd) { d.unlockCmd = item.cmd; saveSoon(); }
+    // Return=0 means the terminal accepted the command. Whether a lock
+    // actually moved depends on its relay wiring and lock delay, which the
+    // protocol never tells us.
+    trace('info', sn, 'unlock accepted (' + item.cmd.split(' ')[0] + ')');
+    return;
+  }
+  item.ok = false;
+  const tried = item.tried || 1;
+  if (tried >= UNLOCK_FORMS.length) {
+    // every wording refused: forget the remembered one so the next press
+    // starts the search over rather than repeating the same dead command
+    if (d && d.unlockCmd) { delete d.unlockCmd; saveSoon(); }
+    trace('err', sn, 'door did not open - terminal rejected every unlock form'
+      + ' (last: ' + item.cmd + ' -> ' + item.result + ')');
+    return;
+  }
+  // step to the next wording, wrapping so a remembered form that has gone
+  // stale still gets the others tried
+  const next = (UNLOCK_FORMS.indexOf(item.cmd) + 1) % UNLOCK_FORMS.length;
+  trace('info', sn, 'unlock form "' + item.cmd.split(' ')[0] + '" rejected ('
+    + item.result + '), trying the next one');
+  enqueue(sn, UNLOCK_FORMS[next],
+    { kind: 'unlock', tried: tried + 1, retryOf: item.retryOf || item.id });
 }
 
 /* ------------------------------------------------------------------- API */
 
+function dirOf(rec) {
+  if (rec.status === 0 || rec.status === 4 || rec.status === 3) return 'in';
+  if (rec.status === 1 || rec.status === 5 || rec.status === 2) return 'out';
+  const d = state.devices[rec.sn];
+  return (d && d.role) || '';
+}
+
+/* ------------------------------------------------------- attendance model */
+
+// These terminals stamp every punch with status 255 ("Punch") - the firmware
+// never says whether the person was arriving or leaving. Direction therefore
+// comes from, in order of trust:
+//   1. an explicit status code, when a terminal is configured to send one
+//   2. the gate role an admin assigned to the terminal
+//   3. alternation from the first punch of the day (in, out, in, out, ...)
+// The lobby here has two unassigned gates, so (3) is what actually runs.
+
+// Firmware reports a face match as verify mode 15; some builds use 20.
+const FACE_MODES = new Set([15, 20]);
+const isFace = (r) => FACE_MODES.has(Number(r.verify));
+
+// A card can be lent, a face cannot, so attendance is computed from face
+// punches only unless someone deliberately turns that off.
+const FACE_ONLY_DEFAULT = process.env.FACE_ONLY !== '0';
+
+// One movement = one arrival or one departure. A punch inside this window of
+// the movement before it is the same person still standing at the gate: the
+// terminal double-reading in the same second, a re-tap because the door was
+// slow, or the second terminal catching the face as they walk past. Counting
+// those as separate movements is what produced 0h days and phantom breaks.
+const DWELL_SEC_DEFAULT = Number(process.env.DWELL_SEC || 180);
+
+const tsOf = (t) => Date.parse(t.replace(' ', 'T')) || 0;
+const dayOf = (t) => t.slice(0, 10);
+
+const faceSetting = () => (state.settings.faceOnly === undefined
+  ? FACE_ONLY_DEFAULT : !!state.settings.faceOnly);
+
+// ?face=0 shows every verification mode for one call without changing the
+// saved rule; ?face=1 forces face-only. Otherwise the saved rule applies.
+function faceOnly(q) {
+  const v = q && q.get ? (q.get('face') || '').toLowerCase() : '';
+  if (v === '0' || v === 'false' || v === 'all') return false;
+  if (v === '1' || v === 'true' || v === 'face') return true;
+  return faceSetting();
+}
+
+function dwellSec() {
+  const n = Number(state.settings.dwellSec);
+  return Number.isFinite(n) && n >= 0 && n <= 3600 ? n : DWELL_SEC_DEFAULT;
+}
+
+// First movement of the day is the arrival, the last is the departure, and the
+// pairs between them are breaks. An odd number in the middle leaves one tap
+// without a partner: it stays visible but is never counted, so a stray punch
+// can neither invent a break nor stretch the day.
+function labelMovements(evs) {
+  if (!evs.length) return evs;
+  evs[0].label = 'Check in';
+  if (evs.length === 1) return evs;
+  evs[evs.length - 1].label = 'Check out';
+  const mid = evs.slice(1, -1);
+  const paired = Math.floor(mid.length / 2) * 2;
+  for (let i = 0; i < paired; i++) mid[i].label = i % 2 ? 'Break end' : 'Break start';
+  for (let i = paired; i < mid.length; i++) mid[i].label = 'Extra punch';
+  return evs;
+}
+
+// One day's punches -> the ordered movements they represent.
+function dayEvents(pin, date, face) {
+  const all = state.logs
+    .filter((r) => r.pin === pin && dayOf(r.time) === date)
+    .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+  const rows = face ? all.filter(isFace) : all;
+
+  const win = dwellSec() * 1000;
+  const evs = [];
+  for (const r of rows) {
+    const prev = evs[evs.length - 1];
+    const dir = dirOf(r);
+    // Where both gates are known, direction alone decides: you cannot arrive
+    // twice without leaving in between, so a second punch at the same gate is
+    // the same movement however much later it came - the door was slow, the
+    // read did not take, someone tapped again on the way past. Only the
+    // opposite gate starts a new movement. Without gate roles there is no
+    // direction to reason from, so closeness in time is all that is left.
+    const sameMove = prev && (dir && prev.dir
+      ? dir === prev.dir
+      : (tsOf(r.time) - tsOf(prev.time)) < win);
+    // the run counts as happening at its last tap: that is the one the person
+    // actually walked through on
+    if (sameMove) { prev.taps++; prev.time = r.time; continue; }
+    evs.push({ time: r.time, from: r.time, dir, verify: r.verify, sn: r.sn, taps: 1 });
+  }
+  labelMovements(evs);
+  evs.taps = rows.length;
+  evs.ignored = all.length - rows.length;
+  return evs;
+}
+
+function daySummary(pin, date, face) {
+  const evs = dayEvents(pin, date, face);
+  const inEv = evs[0] || null;
+  const outEv = evs.length > 1 ? evs[evs.length - 1] : null;
+
+  const breaks = [];
+  let breakMin = 0;
+  for (let i = 1; i < evs.length - 1; i++) {
+    if (evs[i].label !== 'Break start') continue;
+    const nxt = evs[i + 1];
+    if (!nxt || nxt.label !== 'Break end') continue;
+    const min = Math.round((tsOf(nxt.time) - tsOf(evs[i].time)) / 60000);
+    if (min <= 0) continue;
+    breaks.push({ from: evs[i].time, to: nxt.time, min });
+    breakMin += min;
+  }
+
+  const totalMin = inEv && outEv
+    ? Math.round((tsOf(outEv.time) - tsOf(inEv.time)) / 60000) : 0;
+  breakMin = Math.min(breakMin, totalMin);
+  const dow = new Date(date + 'T00:00:00').getDay();
+  return {
+    date, dow,
+    status: evs.length ? 'Present' : (dow === 0 ? 'Weekly off' : 'Absent'),
+    in: inEv ? inEv.time : '',
+    out: outEv ? outEv.time : '',
+    // one lone movement means they were seen but never seen leaving
+    incomplete: evs.length === 1,
+    punches: evs.length, taps: evs.taps || 0, ignored: evs.ignored || 0,
+    breakMin, totalMin, breaks,
+    workMin: Math.max(0, totalMin - breakMin),
+    events: evs,
+  };
+}
+
+const localDate = (d) => d.getFullYear() + '-'
+  + String(d.getMonth() + 1).padStart(2, '0') + '-'
+  + String(d.getDate()).padStart(2, '0');
+
+function dateRange(from, to) {
+  const out = [];
+  const d = new Date(from + 'T00:00:00');
+  const end = new Date(to + 'T00:00:00');
+  while (d <= end && out.length < 400) { out.push(localDate(d)); d.setDate(d.getDate() + 1); }
+  return out;
+}
+
+function attendance(pin, from, to, face) {
+  const days = dateRange(from, to).map((d) => daySummary(pin, d, face));
+  const present = days.filter((d) => d.status === 'Present');
+  const sum = (k) => present.reduce((a, d) => a + d[k], 0);
+  return {
+    pin,
+    name: (state.users[pin] && state.users[pin].name) || '',
+    verifiedBy: face ? 'face' : 'any',
+    days: days.slice().reverse(),
+    totals: {
+      totalDays: days.length,
+      present: present.length,
+      absent: days.filter((d) => d.status === 'Absent').length,
+      sundays: days.filter((d) => d.dow === 0).length,
+      incomplete: days.filter((d) => d.incomplete).length,
+      totalMin: sum('totalMin'),
+      breakMin: sum('breakMin'),
+      workMin: sum('workMin'),
+      ignored: days.reduce((a, d) => a + d.ignored, 0),
+    },
+  };
+}
+
+// The same run of taps that the attendance model folds into one movement also
+// fills the raw log with near-identical rows. Fold them here too, keeping the
+// last tap of each run and remembering how many there were, so the log reads
+// as movements. ?raw=1 turns it off and shows every punch as recorded - the
+// stored history is never touched either way.
+function collapseRepeats(rows) {
+  const asc = rows.slice().sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+  const win = dwellSec() * 1000;
+  const open = new Map();     // pin -> the run currently being extended
+  const out = [];
+  for (const r of asc) {
+    const dir = dirOf(r) || 'none';
+    const run = open.get(r.pin);
+    // Same rule the attendance model uses: with a known gate, only the
+    // opposite one ends the run; with no gate role there is no direction to
+    // reason from, so a run is just taps close together in time - otherwise a
+    // whole day at an unassigned terminal would fold into a single row. A run
+    // never spans a date either way.
+    const sameRun = run && run.dir === dir && dayOf(run.last) === dayOf(r.time)
+      && (dir !== 'none' || (tsOf(r.time) - tsOf(run.last)) < win);
+    if (sameRun) {
+      run.taps++;
+      run.last = r.time;
+      out[run.at] = Object.assign({}, r, { taps: run.taps, from: run.from });
+      continue;
+    }
+    open.set(r.pin, { dir, taps: 1, from: r.time, last: r.time, at: out.length });
+    out.push(Object.assign({}, r, { taps: 1, from: r.time }));
+  }
+  return out;
+}
+
 function filterLogs(q) {
-  const term = (param(q, 'q') || '').toLowerCase();
-  const from = param(q, 'from');
-  const to = param(q, 'to');
-  const sn = param(q, 'sn');
-  const limit = Math.min(Number(param(q, 'limit') || 500) || 500, 20000);
+  const term = (q.get('q') || '').toLowerCase();
+  const fPin = (q.get('pin') || '').trim().toLowerCase();
+  const fName = (q.get('name') || '').trim().toLowerCase();
+  const fDir = (q.get('dir') || '').trim();
+  const fVerify = (q.get('verify') || '').trim();
+  const from = q.get('from');
+  const to = q.get('to');
+  const limit = Math.min(Number(q.get('limit') || 500), 20000);
   let rows = state.logs;
   // resolve display names late: a punch can arrive before the user record syncs
   for (const r of rows) {
@@ -633,205 +858,246 @@ function filterLogs(q) {
   }
   if (from) rows = rows.filter((r) => r.time >= from);
   if (to) rows = rows.filter((r) => r.time <= to + ' 23:59:59');
-  if (sn) rows = rows.filter((r) => r.sn === sn);
   if (term) {
     rows = rows.filter((r) =>
-      String(r.pin).toLowerCase().includes(term) ||
+      r.pin.toLowerCase().includes(term) ||
       (r.name || '').toLowerCase().includes(term) ||
       r.sn.toLowerCase().includes(term));
   }
-  return { total: rows.length, rows: rows.slice(-limit).reverse() };
+  if (fPin) rows = rows.filter((r) => r.pin.toLowerCase().includes(fPin));
+  if (fName) rows = rows.filter((r) => (r.name || '').toLowerCase().includes(fName));
+  if (fVerify === 'face') rows = rows.filter(isFace);
+  else if (fVerify) rows = rows.filter((r) => String(r.verify) === fVerify);
+  if (fDir) rows = rows.filter((r) => (dirOf(r) || 'none') === fDir);
+  if ((q.get('raw') || '') !== '1') rows = collapseRepeats(rows);
+  return rows.slice()
+    .sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0))
+    .slice(0, limit)
+    .map((r) => Object.assign({ dir: dirOf(r) }, r));
 }
 
-// Option keys arrive with or without a leading tilde depending on firmware,
-// and applyOptions strips it, so accept either spelling.
-function opt(info, name) {
-  return info[name] || info['~' + name] || '';
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return (fwd || req.socket.remoteAddress || '').replace(/^::ffff:/, '');
 }
 
-function deviceSummary(d) {
-  const i = d.info || {};
-  const now = Date.now();
+// HR integration is allow-list only, and denied while the list is empty.
+function ipAllowed(req) {
+  const list = state.settings.allowIps || [];
+  if (!list.length) return false;
+  const ip = clientIp(req);
+  return list.some((a) => a === '*' || a === ip);
+}
+
+function dirSize(dir) {
+  const files = [];
+  let total = 0;
+  for (const f of fs.readdirSync(dir)) {
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.isFile()) { files.push({ name: f, bytes: st.size }); total += st.size; }
+    } catch (e) { /* ignore */ }
+  }
+  return { total, files: files.sort((a, b) => b.bytes - a.bytes) };
+}
+
+function serverStats() {
+  const store = dirSize(DATA_DIR);
+  const byDay = {};
+  for (const r of state.logs) byDay[r.time.slice(0, 10)] = (byDay[r.time.slice(0, 10)] || 0) + 1;
+  const series = [];
+  const d = new Date();
+  d.setDate(d.getDate() - 13);
+  for (let i = 0; i < 14; i++) {
+    const key = localDate(d);
+    series.push({ date: key, count: byDay[key] || 0 });
+    d.setDate(d.getDate() + 1);
+  }
+  const mem = process.memoryUsage();
   return {
-    sn: d.sn,
-    name: d.name || i.DeviceName || '',
-    ip: d.ip || '',
-    online: !!d.online,
-    lastSeen: d.lastSeen || 0,
-    silentFor: d.lastSeen ? now - d.lastSeen : null,
-    offlineAfter: offlineAfter(d),
-    pollInterval: d.pollInterval || 0,
-    polls: d.polls || 0,
-    pushCount: d.pushCount || 0,
-    lastPush: d.lastPush || 0,
-    drops: d.drops || 0,
-    lastDrop: d.lastDrop || 0,
-    sessions: d.sessions || 0,
-    firstSeen: d.firstSeen || 0,
-    stamp: d.stamp,
-    opStamp: d.opStamp,
-    cmdsSent: d.cmdsSent || 0,
-    cmdsDone: d.cmdsDone || 0,
-    firmware: opt(i, 'FWVersion'),
-    platform: opt(i, 'Platform'),
-    push: opt(i, 'PushVersion'),
-    mac: opt(i, 'MAC'),
-    deviceIp: opt(i, 'IPAddress'),
-    userCount: opt(i, 'UserCount'),
-    maxUsers: opt(i, 'MaxUserCount'),
-    faceCount: opt(i, 'FaceCount'),
-    maxFaces: opt(i, 'MaxFaceCount'),
-    fpCount: opt(i, 'FPCount'),
-    transactions: opt(i, 'TransactionCount'),
-    infoCount: Object.keys(i).length,
-    info: i,
+    store,
+    counts: {
+      logs: state.logs.length,
+      users: Object.keys(state.users).length,
+      devices: Object.keys(state.devices).length,
+      online: Object.values(state.devices).filter((x) => x.online).length,
+    },
+    series,
+    proc: {
+      uptime: Math.round(process.uptime()),
+      rss: mem.rss, heapUsed: mem.heapUsed,
+      node: process.version, pid: process.pid, port: PORT,
+    },
+    host: {
+      load: os.loadavg().map((x) => Math.round(x * 100) / 100),
+      cpus: os.cpus().length,
+      totalMem: os.totalmem(), freeMem: os.freemem(),
+      platform: os.platform(), hostname: os.hostname(),
+    },
   };
 }
 
-// Turns "is it connected?" into a list of concrete pass/fail checks, so the
-// answer is never just a red dot with no explanation.
-function diagnose() {
-  const out = [];
-  const devices = Object.values(state.devices);
-  const online = devices.filter((d) => d.online);
-  const ips = lanIPs();
-  const now = Date.now();
-  const add = (level, title, detail, fix) => out.push({ level, title, detail, fix: fix || '' });
-
-  add('ok', 'Server is listening',
-    'Port ' + PORT + ' on ' + (ips.length ? ips.join(', ') : 'localhost only')
-    + ' · up ' + Math.round((now - STARTED) / 1000) + 's');
-
-  if (!ips.length) {
-    add('fail', 'No LAN address found',
-      'This machine has no non-loopback IPv4 address, so the terminal has nothing to connect to.',
-      'Connect this computer to the same wired or Wi-Fi network as the terminal.');
-  } else if (ips.length > 1) {
-    add('warn', 'Several network interfaces',
-      'Detected ' + ips.join(', ') + '. The terminal must point at the one on its own subnet.',
-      'Compare with the device IP shown on the terminal (Menu > System Info).');
-  }
-
-  if (!devices.length) {
-    add('fail', 'No terminal has ever connected',
-      'The server has not received a single request from a device.',
-      'On the terminal set Menu > COMM > Cloud Server (ADMS): address '
-      + (ips[0] || 'this PC IP') + ', port ' + PORT
-      + ', Domain Name OFF, Proxy OFF, then reboot it.');
-    return out;
-  }
-
-  for (const d of devices) {
-    const silent = d.lastSeen ? now - d.lastSeen : null;
-    if (d.online) {
-      add('ok', d.sn + ' is connected',
-        'Last contact ' + Math.round(silent / 1000) + 's ago · polls every ~'
-        + Math.round((d.pollInterval || 10000) / 1000) + 's · from ' + (d.ip || '?'));
-    } else if (!d.lastSeen) {
-      add('warn', d.sn + ' has never reported in',
-        'The record exists but no request has arrived.',
-        'Reboot the terminal after saving the ADMS settings.');
-    } else {
-      add('fail', d.sn + ' is offline',
-        'Silent for ' + Math.round(silent / 1000) + 's (expected a poll every ~'
-        + Math.round((d.pollInterval || 10000) / 1000) + 's). Last seen '
-        + new Date(d.lastSeen).toLocaleString() + '.',
-        'Check the terminal is powered on and on the network, and that this PC’s '
-        + 'IP has not changed since it was configured (it is ' + (ips[0] || '?') + ' now).');
-    }
-
-    if (d.online && !Object.keys(d.info || {}).length) {
-      add('warn', d.sn + ' has not sent its options',
-        'Firmware, user count and capacity are unknown.',
-        'Press "Device info" on the Commands tab.');
-    }
-    if (d.online && d.stamp === '9999' && d.pushCount > 0) {
-      add('warn', d.sn + ' is not acknowledging its log pointer',
-        'The device keeps re-sending records it already delivered (duplicates are '
-        + 'discarded, but it wastes the link).',
-        'Harmless. It resolves once the terminal sends a Stamp with its next push.');
-    }
-    const q = state.queue[d.sn] || [];
-    const stuck = q.filter((c) => c.sent && !c.returned && now - c.sent > 120000);
-    if (stuck.length) {
-      add('warn', stuck.length + ' command(s) sent to ' + d.sn + ' with no reply',
-        'The terminal collected them but never confirmed. Oldest '
-        + Math.round((now - stuck[0].sent) / 1000) + 's ago.',
-        'Usually means the firmware does not support that command.');
-    }
-  }
-
-  if (!online.length && devices.length) {
-    add('warn', 'Nothing is connected right now',
-      devices.length + ' known device(s), none currently polling.');
-  }
-  for (const w of startupWarnings) add('warn', 'Startup warning', w);
-  return out;
-}
-
 async function handleApi(req, res, route, q) {
-  if (route === '/health' || route === '/api/health') {
-    const devices = Object.values(state.devices);
+  // ---- HR read-only API, restricted to allow-listed IPs
+  if (route.startsWith('/api/hr/')) {
+    if (!ipAllowed(req)) {
+      trace('err', '', 'HR API denied for ' + clientIp(req));
+      return jsonOut(res, { error: 'forbidden', ip: clientIp(req) }, 403);
+    }
+    const today = localDate(new Date());
+    const to = q.get('to') || today;
+    const from = q.get('from') || to;
+    if (route === '/api/hr/users') {
+      return jsonOut(res, { users: Object.values(state.users) });
+    }
+    if (route === '/api/hr/punches') {
+      return jsonOut(res, { from, to, punches: filterLogs(q) });
+    }
+    if (route === '/api/hr/attendance') {
+      const face = faceOnly(q);
+      const pin = q.get('pin');
+      if (pin) return jsonOut(res, attendance(pin, from, to, face));
+      const rows = Object.keys(state.users)
+        .map((x) => attendance(x, from, to, face))
+        .sort((a, b) => Number(a.pin) - Number(b.pin));
+      return jsonOut(res, { from, to, verifiedBy: face ? 'face' : 'any', employees: rows });
+    }
+    return jsonOut(res, { error: 'unknown endpoint' }, 404);
+  }
+  // Backs the /opendoor kiosk page. Deliberately not behind the HR allow-list:
+  // it is the door button, and the server only listens on the LAN. Set a door
+  // code in settings if the page is reachable from anywhere less trusted.
+  if (route === '/api/door') {
+    const devs = Object.values(state.devices);
     return jsonOut(res, {
-      status: 'ok',
-      uptime: process.uptime(),
-      timestamp: Date.now(),
-      port: PORT,
-      devices: devices.length,
-      online: devices.filter((d) => d.online).length,
-      punches: state.logs.length,
+      devices: devs.length,
+      online: devs.filter((d) => d.online).length,
+      needsPin: !!state.settings.doorPin,
     });
   }
-
+  // Everything known about door attempts, so "it does not work" can be read
+  // as an actual answer: was a terminal online, did it ever collect the
+  // command, and what did it reply.
+  if (route === '/api/door/log') {
+    const items = Object.values(state.queue).flat()
+      .filter((c) => c.kind === 'unlock' || c.kind === 'unlock-probe')
+      .sort((a, b) => b.created - a.created).slice(0, 30)
+      .map((c) => ({
+        id: c.id, sn: c.sn, cmd: c.cmd, probe: c.kind === 'unlock-probe',
+        created: c.created, sent: c.sent, returned: c.returned,
+        result: c.result, ok: c.ok === undefined ? null : c.ok,
+      }));
+    return jsonOut(res, {
+      forms: UNLOCK_FORMS,
+      devices: Object.values(state.devices).map((d) => ({
+        sn: d.sn, online: d.online, lastSeen: d.lastSeen,
+        // set only after a terminal answered Return=0 to one of the forms
+        unlockCmd: d.unlockCmd || '',
+        // a terminal that never picks commands up is the other failure mode
+        lastCmd: d.lastCmd || 0,
+      })),
+      items,
+    });
+  }
+  // Fires every candidate wording once at every online terminal and records
+  // each reply without chaining fallbacks. This is the test that says whether
+  // the terminal understands any unlock command at all.
+  if (route === '/api/door/probe' && req.method === 'POST') {
+    const online = Object.keys(state.devices).filter((sn) => state.devices[sn].online);
+    if (!online.length) return jsonOut(res, { ok: false, error: 'no terminal is online' }, 409);
+    const queued = [];
+    for (const sn of online) {
+      for (const form of UNLOCK_FORMS) queued.push(enqueue(sn, form, { kind: 'unlock-probe' }));
+    }
+    trace('info', '', 'door probe: ' + UNLOCK_FORMS.length + ' form(s) x ' + online.length + ' terminal(s)');
+    return jsonOut(res, { ok: true, targets: online, queued: queued.map((c) => c.id) });
+  }
+  if (route === '/api/opendoor' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    if (state.settings.doorPin && String(p.pin || '') !== String(state.settings.doorPin)) {
+      trace('err', '', 'door code rejected from ' + clientIp(req));
+      return jsonOut(res, { ok: false, error: 'wrong code' }, 401);
+    }
+    const online = Object.keys(state.devices).filter((sn) => state.devices[sn].online);
+    if (!online.length) {
+      return jsonOut(res, { ok: false, error: 'No terminal is online, so nothing can open the door.' }, 409);
+    }
+    const queued = online.map((sn) => enqueue(sn, unlockCommand(sn), { kind: 'unlock' }));
+    trace('info', '', 'door requested from ' + clientIp(req) + ' -> ' + online.length + ' terminal(s)');
+    return jsonOut(res, { ok: true, targets: online, queued: queued.map((c) => ({ id: c.id, sn: c.sn })) });
+  }
+  if (route === '/api/stats') return jsonOut(res, serverStats());
+  if (route === '/api/settings' && req.method === 'GET') {
+    return jsonOut(res, {
+      allowIps: state.settings.allowIps || [], yourIp: clientIp(req),
+      faceOnly: faceSetting(), dwellSec: dwellSec(),
+      doorPinSet: !!state.settings.doorPin,     // never echo the code itself
+    });
+  }
+  if (route === '/api/settings' && req.method === 'POST') {
+    const body = JSON.parse((await readBody(req)) || '{}');
+    if (body.allowIps !== undefined) {
+      state.settings.allowIps = (body.allowIps || [])
+        .map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
+      trace('info', '', 'HR allow-list set to ' + (state.settings.allowIps.join(' ') || '(empty)'));
+    }
+    if (body.faceOnly !== undefined) state.settings.faceOnly = !!body.faceOnly;
+    if (body.doorPin !== undefined) {
+      state.settings.doorPin = String(body.doorPin).trim().slice(0, 32);
+      trace('info', '', 'door code ' + (state.settings.doorPin ? 'set' : 'cleared'));
+    }
+    if (body.dwellSec !== undefined) {
+      const n = Number(body.dwellSec);
+      if (Number.isFinite(n) && n >= 0 && n <= 3600) state.settings.dwellSec = Math.round(n);
+    }
+    saveSoon();
+    return jsonOut(res, {
+      ok: true, allowIps: state.settings.allowIps,
+      faceOnly: faceSetting(), dwellSec: dwellSec(),
+      doorPinSet: !!state.settings.doorPin,
+    });
+  }
+  if (route === '/health' || route === '/api/health') {
+    return jsonOut(res, { status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
+  }
+  if (route === '/api/attendance') {
+    const today = localDate(new Date());
+    const to = q.get('to') || today;
+    const from = q.get('from') || to;
+    const face = faceOnly(q);
+    const pin = q.get('pin');
+    if (pin) return jsonOut(res, attendance(pin, from, to, face));
+    const rows = Object.keys(state.users)
+      .map((p) => { const a = attendance(p, from, to, face); return { pin: p, name: a.name, totals: a.totals }; })
+      .sort((a, b) => Number(a.pin) - Number(b.pin));
+    return jsonOut(res, { from, to, verifiedBy: face ? 'face' : 'any', rows });
+  }
   if (route === '/api/state') {
-    // Only the panels the open tab actually shows are serialised. The old
-    // endpoint shipped every user, device and event on a 3s timer whether the
-    // page needed them or not.
-    const tab = (param(q, 'tab') || 'overview').toLowerCase();
-    const today = new Date().toISOString().slice(0, 10);
-    const devices = Object.values(state.devices).sort((a, b) => b.lastSeen - a.lastSeen);
-    const out = {
+    const rows = filterLogs(q).slice(0, Number(q.get('limit') || 200));
+    const today = localDate(new Date());
+    return jsonOut(res, {
       now: Date.now(),
       port: PORT,
+      tz: process.env.TZ,
       ips: lanIPs(),
-      uptime: Math.round((Date.now() - STARTED) / 1000),
-      devices: devices.map(deviceSummary),
+      devices: Object.values(state.devices).sort((a, b) => b.lastSeen - a.lastSeen),
+      users: Object.values(state.users).sort((a, b) => Number(a.pin) - Number(b.pin)),
+      logs: rows,
       totals: {
         logs: state.logs.length,
         users: Object.keys(state.users).length,
-        devices: devices.length,
-        online: devices.filter((d) => d.online).length,
+        devices: Object.keys(state.devices).length,
         today: state.logs.filter((r) => r.time.startsWith(today)).length,
-        queued: Object.values(state.queue).flat().filter((c) => !c.returned).length,
       },
+      queue: Object.values(state.queue).flat().slice(-40).reverse(),
+      events: state.events.slice(-120).reverse(),
       labels: { verify: VERIFY, status: STATUS },
-    };
-
-    if (tab === 'overview' || tab === 'attendance') {
-      const lim = tab === 'overview' ? 15 : Math.min(Number(param(q, 'limit') || 300) || 300, 5000);
-      const f = filterLogs(q);
-      out.logs = f.rows.slice(0, lim);
-      out.logCount = f.total;
-    }
-    if (tab === 'users') {
-      out.users = Object.values(state.users)
-        .sort((a, b) => (Number(a.pin) || 0) - (Number(b.pin) || 0));
-    }
-    if (tab === 'overview' || tab === 'commands') {
-      out.queue = Object.values(state.queue).flat()
-        .sort((a, b) => b.created - a.created).slice(0, 40);
-    }
-    if (tab === 'diagnostics' || tab === 'overview') {
-      out.checks = diagnose();
-    }
-    if (tab === 'diagnostics') {
-      out.events = state.events.slice(-150).reverse();
-    }
-    return jsonOut(res, out);
+    });
   }
 
   if (route === '/api/export.csv') {
-    const rows = filterLogs(q).rows;
+    const rows = filterLogs(q);
     const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
     const csv = ['Serial,PIN,Name,DateTime,Status,Verify,WorkCode']
       .concat(rows.map((r) => [r.sn, r.pin, r.name, r.time,
@@ -847,10 +1113,21 @@ async function handleApi(req, res, route, q) {
   if (route === '/api/cmd' && req.method === 'POST') {
     let p = {};
     try { p = JSON.parse(await readBody(req) || '{}'); } catch (e) {}
-    const targets = p.sn ? [p.sn] : Object.keys(state.devices);
-    if (!targets.length) return jsonOut(res, { ok: false, error: 'No device has connected yet, so there is nothing to send the command to.' }, 400);
-    const cmd = buildCommand(p.kind, p);
-    if (!cmd) return jsonOut(res, { ok: false, error: 'unknown command' }, 400);
+    const all = Object.keys(state.devices);
+    if (!all.length) return jsonOut(res, { ok: false, error: 'no device connected yet' }, 400);
+    // A command only reaches a terminal that is still polling us. Queueing for
+    // an offline gate used to be indistinguishable from success, which is why
+    // "Open door" looked like it did nothing.
+    const online = all.filter((sn) => state.devices[sn].online);
+    const targets = p.sn ? [p.sn] : online;
+    if (!targets.length) {
+      return jsonOut(res, { ok: false,
+        error: 'no terminal is online right now - ' + all.length
+          + ' known device(s), none polling this server' }, 409);
+    }
+    if (!buildCommand(p.kind, Object.assign({}, p, { sn: targets[0] }))) {
+      return jsonOut(res, { ok: false, error: 'unknown command' }, 400);
+    }
     if (p.kind === 'adduser' && p.pin) {
       const u = state.users[p.pin] || (state.users[p.pin] = { pin: String(p.pin) });
       u.name = p.name || u.name || '';
@@ -859,16 +1136,41 @@ async function handleApi(req, res, route, q) {
       saveSoon();
     }
     if (p.kind === 'deluser' && p.pin) { delete state.users[p.pin]; saveSoon(); }
-    const offline = targets.filter((sn) => !(state.devices[sn] || {}).online);
-    const queued = targets.map((sn) => enqueue(sn, cmd));
+    const queued = targets.map((sn) => enqueue(sn,
+      buildCommand(p.kind, Object.assign({}, p, { sn })), { kind: p.kind }));
     return jsonOut(res, {
-      ok: true, cmd, queued: queued.map((c) => c.id),
-      warning: offline.length
-        ? 'Queued, but ' + offline.join(', ') + ' is offline. It will run when the terminal reconnects.'
-        : '',
+      ok: true, cmd: queued[0].cmd, targets,
+      // the terminal collects this on its next poll, within Delay seconds
+      queued: queued.map((c) => ({ id: c.id, sn: c.sn })),
     });
   }
 
+  // The UI polls this after firing a command so the operator sees what the
+  // terminal actually answered instead of a silent no-op.
+  if (route === '/api/cmd/status') {
+    const ids = (q.get('ids') || '').split(',').map(Number).filter(Boolean);
+    const flat = Object.values(state.queue).flat();
+    const shape = (c) => ({
+      id: c.id, sn: c.sn, cmd: c.cmd, kind: c.kind || '',
+      sent: c.sent, returned: c.returned, result: c.result,
+      ok: c.ok === undefined ? null : c.ok, retryOf: c.retryOf || 0,
+    });
+    return jsonOut(res, {
+      items: flat.filter((c) => ids.includes(c.id)).map(shape),
+      // an unlock that fell back to another wording spawns a follow-up command
+      followups: flat.filter((c) => c.retryOf && ids.includes(c.retryOf)).map(shape),
+    });
+  }
+
+  if (route === '/api/role' && req.method === 'POST') {
+    const p = JSON.parse((await readBody(req)) || '{}');
+    const d = state.devices[p.sn];
+    if (!d) return jsonOut(res, { ok: false, error: 'unknown device' }, 404);
+    d.role = ['in', 'out'].includes(p.role) ? p.role : '';
+    saveSoon();
+    trace('info', p.sn, 'role set to ' + (d.role || 'unassigned'));
+    return jsonOut(res, { ok: true, role: d.role });
+  }
   if (route === '/api/purge' && req.method === 'POST') {
     state.logs.length = 0;
     seen.clear();
@@ -887,709 +1189,667 @@ const HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AIFACE-MARS Attendance</title>
 <style>
-:root{
-  --bg:#0b0f14;--panel:#131a23;--panel2:#0f151c;--line:#232c38;--line2:#1a222c;
-  --fg:#e6edf3;--dim:#8b98a8;--faint:#5d6a7a;
-  --accent:#3b82f6;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;
-}
+:root{--bg:#0d1117;--panel:#161b22;--line:#262d38;--fg:#e6edf3;--dim:#8b949e;
+--accent:#3b82f6;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;}
 *{box-sizing:border-box}
-html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);
-  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  -webkit-font-smoothing:antialiased}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
-
-/* ---------- header + tabs ---------- */
-header{background:var(--panel);border-bottom:1px solid var(--line);
-  position:sticky;top:0;z-index:20}
-.hrow{display:flex;align-items:center;gap:12px;padding:12px 20px;flex-wrap:wrap}
-h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.2px;white-space:nowrap}
-h1 span{color:var(--faint);font-weight:400}
-.spacer{flex:1 1 auto}
-.badge{font-size:11px;padding:3px 10px;border-radius:20px;background:#1c242e;
-  color:var(--dim);border:1px solid var(--line);white-space:nowrap}
-.badge.on{background:rgba(34,197,94,.14);color:var(--ok);border-color:rgba(34,197,94,.35)}
-.badge.off{background:rgba(239,68,68,.12);color:var(--bad);border-color:rgba(239,68,68,.32)}
-.badge.warn{background:rgba(245,158,11,.12);color:var(--warn);border-color:rgba(245,158,11,.32)}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;
-  background:var(--faint);vertical-align:middle}
-.dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(34,197,94,.16)}
-.dot.off{background:var(--bad);box-shadow:0 0 0 3px rgba(239,68,68,.14)}
-.dot.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(245,158,11,.14)}
-
-nav{display:flex;gap:2px;padding:0 12px;overflow-x:auto;scrollbar-width:none}
-nav::-webkit-scrollbar{display:none}
-nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
-  padding:10px 14px;font:inherit;font-size:13px;cursor:pointer;white-space:nowrap;
-  border-radius:0;display:flex;align-items:center;gap:7px}
-nav button:hover{color:var(--fg)}
-nav button.active{color:var(--fg);border-bottom-color:var(--accent)}
-nav .n{font-size:10.5px;background:#1c242e;border:1px solid var(--line);
-  padding:1px 6px;border-radius:10px;color:var(--dim);min-width:18px;text-align:center}
-nav button.active .n{background:rgba(59,130,246,.16);border-color:rgba(59,130,246,.35);color:#9ec5ff}
-
-/* ---------- offline banner ---------- */
-#banner{display:none;padding:9px 20px;background:rgba(239,68,68,.13);
-  border-bottom:1px solid rgba(239,68,68,.3);color:#ffb4b4;font-size:13px}
-#banner.show{display:block}
-#banner button{margin-left:10px;padding:3px 10px;font-size:12px}
-
-/* ---------- layout ---------- */
-.wrap{padding:18px 20px 40px;max-width:1500px;margin:0 auto}
-.tabpane{display:none}
-.tabpane.active{display:block}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
-  margin-bottom:16px}
-.cols{display:grid;gap:14px;grid-template-columns:1fr 360px;align-items:start}
-.cols2{display:grid;gap:14px;grid-template-columns:1fr 1fr;align-items:start}
-@media(max-width:1050px){.cols,.cols2{grid-template-columns:1fr}}
-
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 15px}
-.card .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
-.card .v{font-size:25px;font-weight:600;margin-top:3px;line-height:1.2}
-.card .s{font-size:11.5px;color:var(--faint);margin-top:2px}
-
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-  overflow:hidden;margin-bottom:14px}
-.panel>h2{margin:0;font-size:11.5px;text-transform:uppercase;letter-spacing:.9px;
-  color:var(--dim);padding:11px 14px;border-bottom:1px solid var(--line);
-  display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
-.panel .body{padding:13px 15px}
-.panel .body.tight{padding:10px 14px}
-
-/* ---------- tables ---------- */
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--panel);
+border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;flex-wrap:wrap}
+h1{font-size:16px;margin:0;letter-spacing:.3px}
+.badge{font-size:11px;padding:3px 9px;border-radius:20px;background:#21262d;color:var(--dim);border:1px solid var(--line)}
+.badge.on{background:rgba(34,197,94,.15);color:var(--ok);border-color:rgba(34,197,94,.35)}
+.badge.off{background:rgba(239,68,68,.12);color:var(--bad);border-color:rgba(239,68,68,.3)}
+.wrap{padding:18px 20px;max-width:1400px;margin:0 auto}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .k{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
+.card .v{font-size:26px;font-weight:600;margin-top:4px}
+.cols{display:grid;gap:14px;grid-template-columns:1fr 340px}
+@media(max-width:980px){.cols{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:14px}
+.panel>h2{margin:0;font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);
+padding:11px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.body{padding:12px 14px}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;
-  color:var(--dim);padding:9px 13px;border-bottom:1px solid var(--line);
-  position:sticky;top:0;background:var(--panel);z-index:1}
-td{padding:8px 13px;border-bottom:1px solid var(--line2)}
-tbody tr:last-child td{border-bottom:0}
-tbody tr:hover td{background:#19212b}
-.scroll{max-height:520px;overflow:auto}
-.scroll.sm{max-height:300px}
-
-.pill{font-size:11px;padding:2px 9px;border-radius:20px;background:#1c242e;
-  border:1px solid var(--line);display:inline-block}
-.pill.in{background:rgba(34,197,94,.14);color:var(--ok);border-color:rgba(34,197,94,.3)}
-.pill.out{background:rgba(245,158,11,.14);color:var(--warn);border-color:rgba(245,158,11,.3)}
-
-/* ---------- controls ---------- */
-button{background:#1c242e;color:var(--fg);border:1px solid var(--line);border-radius:7px;
-  padding:7px 12px;font-size:12.5px;cursor:pointer;font-family:inherit;transition:.12s}
-button:hover:not(:disabled){border-color:var(--accent);color:#fff}
-button:disabled{opacity:.45;cursor:not-allowed}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);
+padding:9px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+td{padding:9px 12px;border-bottom:1px solid #1c222b}
+tr:hover td{background:#1a2029}
+.scroll{max-height:460px;overflow:auto}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.pill{font-size:11px;padding:2px 8px;border-radius:20px;background:#21262d;border:1px solid var(--line)}
+.pill.in{background:rgba(34,197,94,.15);color:var(--ok)}
+.pill.out{background:rgba(245,158,11,.15);color:var(--warn)}
+button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:7px;
+padding:7px 12px;font-size:12px;cursor:pointer;font-family:inherit}
+button:hover{border-color:var(--accent);color:#fff}
 button.p{background:var(--accent);border-color:var(--accent);color:#fff}
-button.p:hover:not(:disabled){background:#2f74e0}
-button.d{border-color:rgba(239,68,68,.38);color:#f87171}
-button.d:hover:not(:disabled){background:rgba(239,68,68,.12);border-color:var(--bad);color:#fff}
-input,select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
-  border-radius:7px;padding:7px 10px;font-size:13px;font-family:inherit;width:100%}
-input:focus,select:focus{outline:none;border-color:var(--accent)}
-label.f{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.7px;
-  color:var(--dim);margin-bottom:4px}
+button.d{border-color:rgba(239,68,68,.4);color:#f87171}
+input,select{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:7px;
+padding:7px 10px;font-size:13px;font-family:inherit;width:100%}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .row>*{flex:0 0 auto}
 .btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.fld{flex:1 1 140px;min-width:120px}
-
-/* ---------- misc ---------- */
-.log{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;
-  max-height:340px;overflow:auto;line-height:1.75}
+.log{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;max-height:260px;overflow:auto;line-height:1.7}
 .log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.log .dev{color:#7ee787}.log .srv{color:#79c0ff}.log .err{color:#f87171}
-.log .info{color:var(--dim)}
-.hint{color:var(--dim);font-size:12.5px;line-height:1.75}
-.hint b{color:var(--fg);font-weight:600}
-code{background:var(--panel2);border:1px solid var(--line);padding:1px 6px;
-  border-radius:5px;font-size:12px;font-family:ui-monospace,Menlo,monospace}
-.empty{padding:34px 20px;text-align:center;color:var(--faint);font-size:13px}
-.kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12.5px}
-.kv dt{color:var(--dim)}
-.kv dd{margin:0;color:var(--fg);word-break:break-all}
-
-.chk{display:flex;gap:11px;padding:11px 14px;border-bottom:1px solid var(--line2);
-  align-items:flex-start}
-.chk:last-child{border-bottom:0}
-.chk .ic{width:18px;height:18px;border-radius:50%;flex:0 0 auto;margin-top:1px;
-  display:grid;place-items:center;font-size:11px;font-weight:700}
-.chk.ok .ic{background:rgba(34,197,94,.16);color:var(--ok)}
-.chk.warn .ic{background:rgba(245,158,11,.16);color:var(--warn)}
-.chk.fail .ic{background:rgba(239,68,68,.16);color:var(--bad)}
-.chk .t{font-weight:600;font-size:13px}
-.chk .d{color:var(--dim);font-size:12.5px;margin-top:2px}
-.chk .fx{color:#9ec5ff;font-size:12.5px;margin-top:4px}
-
-#toast{position:fixed;right:18px;bottom:18px;z-index:60;display:flex;
-  flex-direction:column;gap:8px;align-items:flex-end}
-#toast div{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
-  border-radius:8px;padding:10px 14px;font-size:13px;max-width:380px;
-  box-shadow:0 8px 26px rgba(0,0,0,.45);animation:sl .2s ease}
-#toast div.bad{border-left-color:var(--bad)}
-#toast div.good{border-left-color:var(--ok)}
-@keyframes sl{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.log .dev{color:#7ee787}.log .srv{color:#79c0ff}.log .err{color:#f87171}.log .info{color:var(--dim)}
+.hint{color:var(--dim);font-size:12px;line-height:1.7}
+.scroll table{min-width:640px}
+.grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+@media(max-width:820px){
+  .cols{grid-template-columns:1fr}
+  .grid{grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+  .card{padding:10px 12px}.card .v{font-size:20px}
+  h2{flex-wrap:wrap;gap:6px}
+  .body.row>*{flex:1 1 auto;min-width:0}
+  input,select{width:100%}
+  #aList{position:fixed;left:12px;right:12px;top:auto}
+}
+.hint b{color:var(--fg)}
+code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radius:5px;font-size:12px}
+.empty{padding:34px;text-align:center;color:var(--dim)}
+.note{font-size:12px;color:var(--dim);line-height:1.6}
+.tag{font-size:10.5px;padding:2px 8px;border-radius:20px;background:#21262d;
+border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+.tag.face{background:rgba(59,130,246,.16);color:#93c5fd;border-color:rgba(59,130,246,.4)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
+.seg button{border:0;border-radius:0;background:transparent;color:var(--dim);padding:7px 13px}
+.seg button:hover{color:#fff}
+.seg button.on{background:var(--accent);color:#fff}
+/* day timeline: one dot per movement, connected top to bottom */
+.tl{position:relative;padding:4px 0 4px 28px}
+.tl:before{content:'';position:absolute;left:9px;top:18px;bottom:18px;width:2px;background:var(--line)}
+.tl .ev{position:relative;padding:9px 0}
+.tl .ev:before{content:'';position:absolute;left:-24px;top:14px;width:11px;height:11px;
+border-radius:11px;box-sizing:border-box;background:var(--panel);border:2px solid var(--dim)}
+.tl .ev.a:before{background:var(--ok);border-color:var(--ok)}
+.tl .ev.z:before{background:var(--warn);border-color:var(--warn)}
+.tl .ev.bs:before{border-color:var(--warn)}
+.tl .ev.be:before{border-color:var(--ok)}
+.tl .ev.x{opacity:.5}
+.tl .t{font-variant-numeric:tabular-nums}
+.gap{position:relative;margin-left:-4px;font-size:11px;color:var(--dim);padding:1px 0}
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:80;
+background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 16px;
+box-shadow:0 14px 36px rgba(0,0,0,.55);font-size:13px;max-width:min(560px,92vw)}
+.toast.ok{border-color:rgba(34,197,94,.5)}
+.toast.bad{border-color:rgba(239,68,68,.5)}
+td.num{font-variant-numeric:tabular-nums}
+.tabs{display:flex;gap:4px;padding:0 20px;background:var(--panel);
+border-bottom:1px solid var(--line);position:sticky;top:53px;z-index:9;overflow-x:auto}
+.tabs::-webkit-scrollbar{display:none}
+.tab{background:transparent;border:0;border-radius:0;color:var(--dim);padding:12px 15px;
+font-size:13px;white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab:hover{color:var(--fg)}
+.tab.on{color:#fff;border-bottom-color:var(--accent)}
+.tab .n{margin-left:6px;font-size:10.5px;padding:1px 6px;border-radius:20px;
+background:#21262d;color:var(--dim)}
+section[hidden]{display:none}
+/* the big in-dashboard door button, same language as the kiosk page */
+button.door{width:190px;height:190px;border-radius:50%;border:0;color:#fff;
+font:600 17px/1.2 inherit;cursor:pointer;padding:0;
+background:linear-gradient(160deg,#4c8dff,#2563eb 62%,#1d4ed8);
+box-shadow:0 16px 40px rgba(37,99,235,.4),inset 0 1px 0 rgba(255,255,255,.28);
+transition:transform .14s cubic-bezier(.2,.7,.3,1),background .3s,box-shadow .25s}
+button.door:hover{border-color:transparent;transform:translateY(-2px)}
+button.door:active{transform:scale(.96)}
+button.door.busy{background:linear-gradient(160deg,#3f7ae0,#1e51c9)}
+button.door.ok{background:linear-gradient(160deg,#34d27a,#16a34a 62%,#15803d);
+box-shadow:0 16px 40px rgba(34,197,94,.4),inset 0 1px 0 rgba(255,255,255,.28)}
+button.door.bad{background:linear-gradient(160deg,#f87171,#dc2626 62%,#b91c1c);
+box-shadow:0 16px 40px rgba(239,68,68,.38),inset 0 1px 0 rgba(255,255,255,.28)}
+h1{font-size:15px}
+@media(max-width:820px){.tabs{top:auto;position:static}}
 </style></head><body>
-
 <header>
-  <div class="hrow">
-    <h1>AIFACE-MARS <span>&middot; Attendance Server</span></h1>
-    <span class="badge" id="hdrDev"><span class="dot"></span>no device</span>
-    <span class="spacer"></span>
-    <span class="badge" id="hdrPort">&mdash;</span>
-    <span class="badge" id="hdrTick">connecting&hellip;</span>
-  </div>
-  <nav id="tabs">
-    <button data-tab="overview" class="active">Overview</button>
-    <button data-tab="attendance">Attendance <span class="n" id="nLogs">0</span></button>
-    <button data-tab="users">Users <span class="n" id="nUsers">0</span></button>
-    <button data-tab="devices">Devices <span class="n" id="nDev">0</span></button>
-    <button data-tab="commands">Commands <span class="n" id="nQueue">0</span></button>
-    <button data-tab="diagnostics">Diagnostics <span class="n" id="nChk">0</span></button>
-  </nav>
+  <h1>AIFACE-MARS <span style="color:var(--dim);font-weight:400">Attendance</span></h1>
+  <span class="badge" id="hdrPort"></span>
+  <span class="badge" id="hdrDev">no device</span>
+  <span style="flex:1"></span>
+  <span class="badge" id="hdrTick">-</span>
 </header>
 
-<div id="banner">
-  <b>Lost contact with the server.</b>
-  <span id="bannerMsg">Retrying&hellip;</span>
-  <button onclick="retryNow()">Retry now</button>
-</div>
+<nav class="tabs" id="tabs">
+  <button class="tab on" data-tab="att">Attendance</button>
+  <button class="tab" data-tab="log">Live log</button>
+  <button class="tab" data-tab="door">Door</button>
+  <button class="tab" data-tab="dev">Devices</button>
+  <button class="tab" data-tab="srv">Server &amp; API</button>
+</nav>
 
 <div class="wrap">
 
-  <!-- ============ OVERVIEW ============ -->
-  <section class="tabpane active" data-pane="overview">
-    <div class="grid">
-      <div class="card"><div class="k">Punches today</div><div class="v" id="cToday">0</div>
-        <div class="s" id="cTodayS">&nbsp;</div></div>
-      <div class="card"><div class="k">Total punches</div><div class="v" id="cTotal">0</div>
-        <div class="s" id="cTotalS">&nbsp;</div></div>
-      <div class="card"><div class="k">Enrolled users</div><div class="v" id="cUsers">0</div>
-        <div class="s">synced from the terminal</div></div>
-      <div class="card"><div class="k">Devices online</div><div class="v" id="cDev">0</div>
-        <div class="s" id="cDevS">&nbsp;</div></div>
-    </div>
-    <div class="cols">
-      <div class="panel">
-        <h2>Latest punches
-          <button onclick="go('attendance')">View all</button></h2>
-        <div class="scroll">
-          <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th>
-            <th>Verified by</th></tr></thead>
-          <tbody id="tbRecent"></tbody></table>
-          <div class="empty" id="emptyRecent">Waiting for the first punch&hellip;</div>
-        </div>
+<!-- ------------------------------------------------------------ attendance -->
+<section data-panel="att">
+  <div class="grid">
+    <div class="card"><div class="k">Punches today</div><div class="v" id="cToday">0</div></div>
+    <div class="card"><div class="k">Total punches</div><div class="v" id="cTotal">0</div></div>
+    <div class="card"><div class="k">Enrolled users</div><div class="v" id="cUsers">0</div></div>
+    <div class="card"><div class="k">Devices</div><div class="v" id="cDev">0</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Employee attendance
+      <span class="row">
+        <span class="tag face" id="aRule">Face verified only</span>
+        <button onclick="attCsv()">Download CSV</button>
+      </span>
+    </h2>
+    <div class="body row">
+      <div style="position:relative;min-width:250px;flex:1 1 250px">
+        <input id="aSearch" placeholder="Search employee by name or PIN, or leave blank for everyone"
+               autocomplete="off" oninput="pickFilter()" onfocus="pickOpen()">
+        <div id="aList" style="display:none;position:absolute;z-index:30;left:0;right:0;top:38px;
+             max-height:280px;overflow:auto;background:var(--panel);border:1px solid var(--line);
+             border-radius:8px;box-shadow:0 12px 32px rgba(0,0,0,.5)"></div>
       </div>
-      <div>
-        <div class="panel">
-          <h2>Connection</h2>
-          <div id="ovChecks"></div>
-        </div>
-        <div class="panel">
-          <h2>Quick actions</h2>
-          <div class="body">
-            <div class="btns">
-              <button class="p" onclick="cmd('unlock')">Open door</button>
-              <button onclick="cmd('synctime')">Sync clock</button>
-              <button onclick="cmd('queryuser')">Pull users</button>
-              <button onclick="cmd('queryatt',{days:7})">Pull 7 days</button>
-            </div>
+      <input type="hidden" id="aUser">
+      <span class="seg" id="aRange">
+        <button class="on" data-d="0" onclick="setRange('att',0)">Today</button>
+        <button data-d="7" onclick="setRange('att',7)">7 days</button>
+        <button data-d="30" onclick="setRange('att',30)">30 days</button>
+        <button data-d="90" onclick="setRange('att',90)">90 days</button>
+      </span>
+      <input id="aFrom" type="date" style="width:150px" onchange="markRange('aRange','x');loadAtt()">
+      <input id="aTo" type="date" style="width:150px" onchange="markRange('aRange','x');loadAtt()">
+      <span class="seg">
+        <button id="aFace1" class="on" onclick="setFace(1)">Face only</button>
+        <button id="aFace0" onclick="setFace(0)">Every mode</button>
+      </span>
+    </div>
+    <div id="aKpis"></div>
+    <div class="scroll">
+      <table id="attTable">
+        <thead><tr><th>Date</th><th>Status</th><th>Check-in &ndash; Check-out</th>
+        <th>Total</th><th>Break</th><th>Net hours</th><th>Movements</th></tr></thead>
+        <tbody id="tbAtt"></tbody></table>
+      <div class="empty" id="emptyAtt">Loading&hellip;</div>
+    </div>
+    <div class="body note" id="aFoot" style="border-top:1px solid var(--line)"></div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------------- log -->
+<section data-panel="log" hidden>
+  <div class="panel">
+    <h2>Attendance log
+      <span class="row">
+        <button onclick="exportCsv()">Export CSV</button>
+        <button class="d" onclick="purge()">Clear history</button>
+      </span>
+    </h2>
+    <div class="body row">
+      <input id="fq" placeholder="Search anything" style="flex:1;min-width:140px" oninput="debounced()">
+      <input id="fpin" placeholder="PIN" style="width:90px" oninput="debounced()">
+      <input id="fname" placeholder="Name" style="width:140px" oninput="debounced()">
+      <select id="fdir" style="width:130px" onchange="refresh()">
+        <option value="">Type: all</option>
+        <option value="in">Check-in</option>
+        <option value="out">Check-out</option>
+        <option value="none">Unassigned</option>
+      </select>
+      <select id="fverify" style="width:160px" onchange="refresh()">
+        <option value="face">Verified by: Face</option>
+        <option value="">Verified by: all</option>
+      </select>
+      <span class="seg" id="fRange">
+        <button class="on" data-d="0" onclick="setRange('log',0)">Today</button>
+        <button data-d="7" onclick="setRange('log',7)">7 days</button>
+        <button data-d="30" onclick="setRange('log',30)">30 days</button>
+        <button data-d="" onclick="setRange('log','')">All</button>
+      </span>
+      <input id="ffrom" type="date" style="width:150px" onchange="markRange('fRange','x');refresh()">
+      <input id="fto" type="date" style="width:150px" onchange="markRange('fRange','x');refresh()">
+      <label class="hint" style="display:flex;align-items:center;gap:6px">
+        <input id="fraw" type="checkbox" onchange="refresh()"> every tap
+      </label>
+      <button onclick="clearFilters()">Reset</button>
+    </div>
+    <div class="scroll" style="max-height:620px">
+      <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th></tr></thead>
+      <tbody id="tbLogs"></tbody></table>
+      <div class="empty" id="emptyLogs">Waiting for the first punch from the device...</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Users on device</h2>
+    <div class="scroll" style="max-height:300px">
+      <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
+      <tbody id="tbUsers"></tbody></table>
+      <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull users</b> on the Devices tab.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------------ door -->
+<section data-panel="door" hidden>
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>Open the door
+          <span class="row"><a href="/opendoor" target="_blank"><button>Full-screen page</button></a></span>
+        </h2>
+        <div class="body" style="text-align:center;padding:26px 16px">
+          <button class="door" id="bigDoor" onclick="openDoor()">
+            <svg viewBox="0 0 32 32" width="40" height="40" style="display:block;margin:0 auto 8px">
+              <path d="M20 5H9a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h11" fill="none" stroke="#fff"
+                stroke-width="2" stroke-linecap="round"/>
+              <path d="M20 16h6m-3-3 3 3-3 3" fill="none" stroke="#fff" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Open door
+          </button>
+          <div class="note" id="doorMsg" style="margin-top:16px">
+            Unlocks every terminal that is online.
           </div>
         </div>
       </div>
-    </div>
-  </section>
 
-  <!-- ============ ATTENDANCE ============ -->
-  <section class="tabpane" data-pane="attendance">
-    <div class="panel">
-      <h2>Filters
-        <span class="row">
-          <button onclick="exportCsv()">Export CSV</button>
-          <button class="d" onclick="purge()">Clear history</button>
-        </span>
-      </h2>
-      <div class="body">
-        <div class="row">
-          <div class="fld" style="flex:2 1 220px">
-            <label class="f" for="fq">Search</label>
-            <input id="fq" placeholder="PIN, name or serial" oninput="debounced()">
-          </div>
-          <div class="fld"><label class="f" for="ffrom">From</label>
-            <input id="ffrom" type="date" onchange="refresh(true)"></div>
-          <div class="fld"><label class="f" for="fto">To</label>
-            <input id="fto" type="date" onchange="refresh(true)"></div>
-          <div class="fld"><label class="f" for="fdev">Device</label>
-            <select id="fdev" onchange="refresh(true)"><option value="">All devices</option></select></div>
-          <div class="fld"><label class="f" for="flimit">Show</label>
-            <select id="flimit" onchange="refresh(true)">
-              <option value="100">100 rows</option>
-              <option value="300" selected>300 rows</option>
-              <option value="1000">1000 rows</option>
-              <option value="5000">5000 rows</option>
-            </select></div>
-          <div class="fld" style="flex:0 0 auto;align-self:flex-end">
-            <button onclick="clearFilters()">Reset</button></div>
-        </div>
-      </div>
-    </div>
-    <div class="panel">
-      <h2>Attendance log <span class="badge" id="logCount">0</span></h2>
-      <div class="scroll" style="max-height:none">
-        <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th>
-          <th>Verified by</th><th>Device</th></tr></thead>
-        <tbody id="tbLogs"></tbody></table>
-        <div class="empty" id="emptyLogs">No punches match these filters.</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============ USERS ============ -->
-  <section class="tabpane" data-pane="users">
-    <div class="cols">
       <div class="panel">
-        <h2>Users on device
+        <h2>Door diagnostics
           <span class="row">
-            <input id="uq" placeholder="Filter users" style="width:180px" oninput="renderUsers()">
-            <button onclick="cmd('queryuser')">Pull from device</button>
+            <button onclick="doorProbe()">Try every unlock form</button>
+            <button onclick="loadDoor()">Refresh</button>
           </span>
         </h2>
-        <div class="scroll" style="max-height:none">
-          <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th>
-            <th>Biometrics</th><th></th></tr></thead>
-          <tbody id="tbUsers"></tbody></table>
-          <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull from device</b>.</div>
+        <div class="body note">
+          The protocol only ever tells us whether the terminal <b>accepted</b> the command.
+          If a form comes back <b>0</b> and the door still does not move, the command is fine
+          and the lock is not: check <b>Menu &rarr; Access Control &rarr; Door Lock Delay</b>
+          is above 0 on the terminal, and that the lock is wired to that terminal's relay
+          rather than to a separate access panel.
+        </div>
+        <div id="doorDev" class="body" style="border-top:1px solid var(--line)"></div>
+        <div class="scroll" style="max-height:320px">
+          <table><thead><tr><th>When</th><th>Terminal</th><th>Command</th><th>Collected</th><th>Reply</th></tr></thead>
+          <tbody id="tbDoor"></tbody></table>
+          <div class="empty" id="emptyDoor">No door command has been sent yet.</div>
         </div>
       </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Door access</h2>
+        <div class="body">
+          <div class="note" style="margin-bottom:10px">
+            <a href="/opendoor" target="_blank" style="color:var(--accent)">/opendoor</a> is a
+            full-screen button meant for a tablet at reception. Anyone who can reach this server
+            can press it, so set a code if that page is reachable from outside your network.
+          </div>
+          <div class="row">
+            <input id="doorPin" placeholder="door code (blank = no code)" style="flex:1;min-width:150px">
+            <button onclick="saveDoorPin()">Save code</button>
+          </div>
+          <div class="note" id="doorPinMsg" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- --------------------------------------------------------------- devices -->
+<section data-panel="dev" hidden>
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>Device</h2>
+        <div class="body" id="devBox"><div class="hint">No device has connected yet.</div></div>
+      </div>
+      <div class="panel">
+        <h2>Protocol trace</h2>
+        <div class="log body" id="trace"></div>
+      </div>
+      <div class="panel">
+        <h2>Wire the device to this server</h2>
+        <div class="body hint" id="setup"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Commands</h2>
+        <div class="body">
+          <div class="btns">
+            <button class="p" onclick="openDoor()">Open door</button>
+            <button onclick="cmd('synctime')">Sync clock</button>
+            <button onclick="cmd('queryuser')">Pull users</button>
+            <button onclick="cmd('queryatt',{days:7})">Pull 7 days</button>
+            <button onclick="cmd('info')">Device info</button>
+            <button onclick="cmd('check')">Full re-sync</button>
+            <button onclick="cmd('reboot')">Reboot</button>
+          </div>
+        </div>
+      </div>
+
       <div class="panel">
         <h2>Add / update user</h2>
         <div class="body">
-          <div class="row" style="margin-bottom:9px">
-            <div class="fld"><label class="f" for="uPin">PIN (user ID)</label>
-              <input id="uPin" placeholder="e.g. 51"></div>
-            <div class="fld"><label class="f" for="uName">Name</label>
-              <input id="uName" placeholder="Full name"></div>
+          <div class="row" style="margin-bottom:8px">
+            <input id="uPin" placeholder="PIN (user ID)" style="flex:1;min-width:110px">
+            <input id="uName" placeholder="Name" style="flex:1;min-width:110px">
           </div>
-          <div class="row" style="margin-bottom:11px">
-            <div class="fld"><label class="f" for="uCard">Card number</label>
-              <input id="uCard" placeholder="optional"></div>
-            <div class="fld"><label class="f" for="uPri">Privilege</label>
-              <select id="uPri">
-                <option value="0">User</option><option value="2">Enroller</option>
-                <option value="6">Manager</option><option value="14">Super admin</option>
-              </select></div>
+          <div class="row" style="margin-bottom:8px">
+            <input id="uCard" placeholder="HID card no. (optional)" style="flex:1;min-width:110px">
+            <select id="uPri" style="width:130px">
+              <option value="0">User</option><option value="2">Enroller</option>
+              <option value="6">Manager</option><option value="14">Super admin</option>
+            </select>
           </div>
           <div class="btns">
             <button class="p" onclick="addUser()">Push to device</button>
             <button class="d" onclick="delUser()">Delete PIN</button>
           </div>
-          <p class="hint" style="margin:11px 0 0">The face template still has to be enrolled at
-          the terminal &mdash; this creates the user record so the face can be registered
-          against it.</p>
+          <p class="hint" style="margin:10px 0 0">The face template still has to be enrolled at the terminal &mdash;
+          this creates the user record so the face can be registered against it.</p>
         </div>
       </div>
-    </div>
-  </section>
 
-  <!-- ============ DEVICES ============ -->
-  <section class="tabpane" data-pane="devices">
-    <div id="devList"></div>
-    <div class="panel" id="devEmpty" style="display:none">
-      <div class="empty">No terminal has connected yet. Open the
-        <b>Diagnostics</b> tab for the exact settings to enter on the device.</div>
-    </div>
-  </section>
-
-  <!-- ============ COMMANDS ============ -->
-  <section class="tabpane" data-pane="commands">
-    <div class="cols">
-      <div>
-        <div class="panel">
-          <h2>Send a command
-            <select id="cmdTarget" style="width:auto;min-width:190px">
-              <option value="">All devices</option></select></h2>
-          <div class="body">
-            <div class="btns" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
-              <button class="p" onclick="cmd('unlock')">Open door</button>
-              <button onclick="cmd('synctime')">Sync clock</button>
-              <button onclick="cmd('queryuser')">Pull users</button>
-              <button onclick="cmd('queryatt',{days:7})">Pull 7 days</button>
-              <button onclick="cmd('queryatt',{days:30})">Pull 30 days</button>
-              <button onclick="cmd('info')">Device info</button>
-              <button onclick="cmd('check')">Full re-sync</button>
-              <button onclick="cmd('reboot',null,'Reboot the terminal now?')">Reboot</button>
-              <button class="d" onclick="cmd('clearlog',null,'Erase ALL attendance logs stored on the device? The copy on this server is kept.')">Erase device logs</button>
-              <button class="d" onclick="cmd('cleardata',null,'Erase ALL users, faces and logs on the device? This cannot be undone.')">Factory clear data</button>
-            </div>
-          </div>
-        </div>
-        <div class="panel">
-          <h2>Raw command</h2>
-          <div class="body">
-            <div class="row">
-              <input id="rawCmd" class="mono" placeholder="e.g. SET OPTION DoorSensorType=0"
-                style="flex:1;min-width:200px" onkeydown="if(event.key==='Enter')sendRaw()">
-              <button onclick="sendRaw()">Send</button>
-            </div>
-            <p class="hint" style="margin:9px 0 0">Sent verbatim to the terminal as
-            <code>C:id:your text</code>. Use only documented ZK push commands.</p>
-          </div>
-        </div>
-      </div>
       <div class="panel">
-        <h2>Command queue <button onclick="refresh(true)">Refresh</button></h2>
-        <div class="scroll sm">
-          <table><thead><tr><th>#</th><th>Command</th><th>State</th></tr></thead>
-          <tbody id="tbQueue"></tbody></table>
-          <div class="empty" id="emptyQueue">Queue is empty.</div>
-        </div>
+        <h2>Command queue</h2>
+        <div class="log body" id="queue"></div>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============ DIAGNOSTICS ============ -->
-  <section class="tabpane" data-pane="diagnostics">
-    <div class="cols">
-      <div>
-        <div class="panel">
-          <h2>Connection checks <button onclick="refresh(true)">Re-check</button></h2>
-          <div id="diagChecks"></div>
-        </div>
-        <div class="panel">
-          <h2>Protocol trace
-            <span class="row">
-              <input id="tq" placeholder="filter" style="width:150px" oninput="renderTrace()">
-              <label class="hint" style="display:flex;gap:5px;align-items:center">
-                <input type="checkbox" id="tauto" checked style="width:auto"> follow</label>
-            </span>
-          </h2>
-          <div class="log body" id="trace"></div>
-        </div>
+<!-- ---------------------------------------------------------------- server -->
+<section data-panel="srv" hidden>
+  <div class="panel">
+    <h2>Server
+      <span class="row"><button onclick="loadStats()">Refresh</button></span>
+    </h2>
+    <div id="statBox" class="body"><div class="hint">Loading...</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Attendance rules</h2>
+    <div class="body">
+      <div class="note" style="margin-bottom:10px">These apply everywhere &mdash; the dashboard,
+      the CSV exports and the HR API.</div>
+      <div class="row">
+        <label class="note"><input type="checkbox" id="setFace" style="width:auto;margin-right:6px"
+          onchange="saveRules()">Count face-verified punches only</label>
+        <label class="note">Fold repeat taps within
+          <input id="setDwell" type="number" min="0" max="60" style="width:70px;margin:0 6px"
+            onchange="saveRules()"> minutes into one movement</label>
       </div>
-      <div>
-        <div class="panel">
-          <h2>Wire the device to this server</h2>
-          <div class="body hint" id="setup"></div>
-        </div>
-        <div class="panel">
-          <h2>Server</h2>
-          <div class="body"><dl class="kv" id="srvInfo"></dl></div>
-        </div>
+      <div class="note" id="ruleMsg" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>HR API</h2>
+    <div class="body">
+      <div class="note" style="margin-bottom:8px">
+        Read-only API for your HR system. Only the IP addresses listed here can call it &mdash;
+        an empty list blocks everyone. Your current IP is <b id="myIp">?</b>.
+      </div>
+      <div class="row">
+        <input id="ipList" placeholder="103.119.254.234, 49.37.0.0  (comma separated, * = any)" style="flex:1;min-width:240px">
+        <button class="p" onclick="saveIps()">Save allow-list</button>
+        <button onclick="useMyIp()">Use my IP</button>
+      </div>
+      <div id="ipMsg" class="note" style="margin-top:8px"></div>
+      <div class="note" style="margin-top:12px">
+        <b>Endpoints</b> &mdash; share these with HR:<br>
+        <span class="mono" id="hrUrls"></span>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
 </div>
-<div id="toast"></div>
+
+<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50" onclick="closeModal(event)">
+  <div style="max-width:560px;margin:6vh auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden" onclick="event.stopPropagation()">
+    <div style="padding:16px 18px;border-bottom:1px solid var(--line)">
+      <b id="mTitle"></b><div class="hint" id="mDate"></div>
+    </div>
+    <div style="padding:8px 18px;max-height:58vh;overflow:auto" id="mBody"></div>
+    <div style="padding:12px 18px;border-top:1px solid var(--line)">
+      <button style="width:100%" onclick="closeModal()">Done</button></div>
+  </div>
+</div>
+
 <script>
-var S = {};                  // last payload from the server
-var TAB = 'overview';
-var LAB = {verify:{}, status:{}};
-var typeTimer = null, pollTimer = null;
-var inFlight = null;         // guards against overlapping polls
-var fails = 0, lastOk = 0;
+// A thrown error used to stop the whole dashboard silently: everything still
+// drew, but nothing ever loaded. Surface it where it can be seen.
+window.onerror = function(msg, src, line, col){
+  var el = document.getElementById('hdrTick');
+  if (el){ el.textContent = 'script error: ' + msg + ' (line ' + line + ')'; el.className = 'badge off'; }
+  return false;
+};
+var LAB = {verify:{},status:{}};
+var timer = null;
+var ATT_SEEDED = false;
 
 function q(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
-function num(n){ return (Number(n)||0).toLocaleString(); }
 function ago(ms){
-  if (!ms) return 'never';
   var s = Math.round((Date.now()-ms)/1000);
-  if (s < 5) return 'just now';
   if (s < 60) return s + 's ago';
   if (s < 3600) return Math.round(s/60) + 'm ago';
   if (s < 86400) return Math.round(s/3600) + 'h ago';
   return Math.round(s/86400) + 'd ago';
 }
-function dur(s){
-  s = Math.round(s||0);
-  if (s < 60) return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
-  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-  return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
-}
-function toast(msg, kind){
-  var d = document.createElement('div');
-  d.className = kind || '';
-  d.textContent = msg;
-  q('toast').appendChild(d);
-  setTimeout(function(){
-    d.style.opacity = '0';
-    d.style.transition = 'opacity .3s';
-    setTimeout(function(){ d.remove(); }, 320);
-  }, kind === 'bad' ? 6000 : 3200);
-}
-
-/* ---------------- tabs ---------------- */
-function go(tab){
-  TAB = tab;
-  var bs = document.querySelectorAll('#tabs button');
-  for (var i = 0; i < bs.length; i++)
-    bs[i].classList.toggle('active', bs[i].getAttribute('data-tab') === tab);
-  var ps = document.querySelectorAll('.tabpane');
-  for (var j = 0; j < ps.length; j++)
-    ps[j].classList.toggle('active', ps[j].getAttribute('data-pane') === tab);
-  try { localStorage.setItem('aiface.tab', tab); } catch (e) {}
-  if (location.hash.slice(1) !== tab) history.replaceState(null, '', '#' + tab);
-  refresh(true);
-}
-document.getElementById('tabs').addEventListener('click', function(e){
-  var b = e.target.closest('button[data-tab]');
-  if (b) go(b.getAttribute('data-tab'));
-});
-window.addEventListener('hashchange', function(){
-  var t = location.hash.slice(1);
-  if (t && t !== TAB) go(t);
-});
-
-/* ---------------- polling ---------------- */
 function params(){
   var p = new URLSearchParams();
-  p.set('tab', TAB);
-  if (TAB === 'attendance' || TAB === 'overview') {
-    if (q('fq').value) p.set('q', q('fq').value);
-    if (q('ffrom').value) p.set('from', q('ffrom').value);
-    if (q('fto').value) p.set('to', q('fto').value);
-    if (q('fdev').value) p.set('sn', q('fdev').value);
-    p.set('limit', q('flimit').value || '300');
-  }
+  if (q('fq').value) p.set('q', q('fq').value);
+  if (q('fpin').value) p.set('pin', q('fpin').value);
+  if (q('fname').value) p.set('name', q('fname').value);
+  if (q('fdir').value) p.set('dir', q('fdir').value);
+  if (q('fverify').value) p.set('verify', q('fverify').value);
+  if (q('ffrom').value) p.set('from', q('ffrom').value);
+  if (q('fto').value) p.set('to', q('fto').value);
+  if (q('fraw').checked) p.set('raw', '1');
+  p.set('limit','300');
   return p;
 }
-function debounced(){ clearTimeout(typeTimer); typeTimer = setTimeout(function(){ refresh(true); }, 280); }
-
-// One request at a time, with a hard timeout. Overlapping 3s polls used to
-// stack up whenever the server was busy, which made the page feel frozen.
-function refresh(force){
-  if (inFlight) { if (!force) return; inFlight.abort(); inFlight = null; }
-  var ac = new AbortController();
-  inFlight = ac;
-  var kill = setTimeout(function(){ ac.abort(); }, 12000);
-
-  fetch('/api/state?' + params().toString(), {signal: ac.signal, cache: 'no-store'})
-    .then(function(r){
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    })
-    .then(function(s){
-      clearTimeout(kill);
-      if (inFlight === ac) inFlight = null;
-      fails = 0; lastOk = Date.now();
-      q('banner').classList.remove('show');
-      render(s);
-    })
-    .catch(function(err){
-      clearTimeout(kill);
-      if (inFlight === ac) inFlight = null;
-      if (err && err.name === 'AbortError' && !force) return;
-      fails++;
-      q('hdrTick').textContent = 'no reply';
-      q('hdrTick').className = 'badge off';
-      if (fails >= 2) {
-        q('banner').classList.add('show');
-        q('bannerMsg').textContent = 'Attempt ' + fails + ' failed'
-          + (lastOk ? ' · last update ' + ago(lastOk) : '')
-          + '. Is "node server.js" still running?';
-      }
-    });
+function debounced(){ clearTimeout(timer); timer = setTimeout(refresh, 250); }
+function clearFilters(){
+  ['fq','fpin','fname','fdir'].forEach(function(id){ q(id).value = ''; });
+  q('fverify').value = 'face';
+  q('fraw').checked = false;
+  setRange('log', 0);                // reset lands on today, like a fresh open
 }
-function retryNow(){ fails = 0; refresh(true); }
 
-// Back off while the server is unreachable, and stop polling entirely when the
-// tab is in the background.
-function schedule(){
-  clearTimeout(pollTimer);
-  var base = (TAB === 'overview' || TAB === 'diagnostics') ? 3000 : 5000;
-  var wait = fails ? Math.min(30000, base * Math.pow(2, Math.min(fails, 4))) : base;
-  pollTimer = setTimeout(function(){
-    if (!document.hidden) refresh(false);
-    schedule();
-  }, wait);
+function isoDay(back){
+  var d = new Date(Date.now() - (Number(back) || 0) * 86400000);
+  var p = function(x){ return String(x).padStart(2, '0'); };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
 }
-document.addEventListener('visibilitychange', function(){
-  if (!document.hidden) { fails = 0; refresh(true); }
+
+// Both the log and the attendance report open on today and share one set of
+// range buttons, so "what happened today" is the default question either tab
+// answers. Typing in a date box directly drops the highlight - the range is
+// then whatever was typed.
+function markRange(id, days){
+  var box = document.getElementById(id);
+  if (!box) return;
+  var bs = box.getElementsByTagName('button');
+  for (var i = 0; i < bs.length; i++)
+    bs[i].className = bs[i].getAttribute('data-d') === String(days) ? 'on' : '';
+}
+
+function setRange(scope, days){
+  var att = scope === 'att';
+  var all = days === '' || days === null;
+  document.getElementById(att ? 'aFrom' : 'ffrom').value = all ? '' : isoDay(days);
+  document.getElementById(att ? 'aTo' : 'fto').value = all ? '' : isoDay(0);
+  markRange(att ? 'aRange' : 'fRange', all ? '' : days);
+  if (att) loadAtt(); else refresh();
+}
+var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
+var DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+// "2026-09-03 11:25:06" -> {date:"03 Sept (Thu)", time:"11:25 AM"}
+function fmtStamp(str){
+  var m = /^([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[ T]([0-9]{2}):([0-9]{2}))?/.exec(str || '');
+  if (!m) return { date: str || '', time: '' };
+  var dt = new Date(+m[1], +m[2] - 1, +m[3]);
+  var date = m[3] + ' ' + MONTHS[+m[2] - 1] + ' (' + DAYS[dt.getDay()] + ')';
+  if (m[4] === undefined) return { date: date, time: '' };
+  var hh = +m[4], ap = hh < 12 ? 'AM' : 'PM';
+  var h12 = hh % 12; if (!h12) h12 = 12;
+  return { date: date, time: h12 + ':' + m[5] + ' ' + ap };
+}
+
+var TAB = 'att';
+function showTab(name){
+  TAB = name;
+  var tabs = document.querySelectorAll('.tab');
+  for (var i = 0; i < tabs.length; i++)
+    tabs[i].className = 'tab' + (tabs[i].dataset.tab === name ? ' on' : '');
+  var secs = document.querySelectorAll('section[data-panel]');
+  for (var j = 0; j < secs.length; j++) secs[j].hidden = secs[j].dataset.panel !== name;
+  try { localStorage.setItem('tab', name); } catch (e) {}
+  if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
+  if (name === 'door') loadDoor();
+  if (name === 'srv') { loadStats(); loadIps(); }
+  refresh();
+}
+document.getElementById('tabs').addEventListener('click', function(e){
+  var b = e.target.closest('.tab');
+  if (b) showTab(b.dataset.tab);
+});
+window.addEventListener('hashchange', function(){
+  var h = location.hash.slice(1);
+  if (h && h !== TAB && document.querySelector('section[data-panel="' + h + '"]')) showTab(h);
 });
 
-/* ---------------- render ---------------- */
+function boot(){
+  // the hash wins so a tab can be linked to directly, then the last tab used
+  var saved = location.hash.slice(1);
+  if (!saved) { try { saved = localStorage.getItem('tab') || 'att'; } catch (e) { saved = 'att'; } }
+  if (!document.querySelector('section[data-panel="' + saved + '"]')) saved = 'att';
+  // every panel opens on today; the range buttons widen it from there
+  q('ffrom').value = isoDay(0);
+  q('fto').value = isoDay(0);
+  showTab(saved);
+  loadIps();
+  setInterval(function(){ if (TAB === 'srv') loadStats(); }, 30000);
+  setInterval(function(){ if (TAB === 'door') loadDoor(); }, 5000);
+}
+
+function refresh(){
+  fetch('/api/state?' + params().toString())
+    .then(function(r){ return r.json(); })
+    .then(render)
+    .catch(function(){ q('hdrTick').textContent = 'server unreachable'; });
+}
+
 function render(s){
-  S = s;
-  LAB = s.labels || LAB;
-  var t = s.totals;
-
-  q('hdrPort').textContent = 'port ' + s.port + ' · up ' + dur(s.uptime);
+  LAB = s.labels;
+  var vsel = q('fverify');
+  if (vsel.options.length <= 2) {
+    var seen = {};
+    Object.keys(LAB.verify || {}).forEach(function(k){
+      // 15 and 20 are both "Face" and are already covered by the Face option
+      if (LAB.verify[k] === 'Face' || seen[LAB.verify[k]]) return;
+      seen[LAB.verify[k]] = 1;
+      var o = document.createElement('option'); o.value = k; o.textContent = LAB.verify[k];
+      vsel.appendChild(o);
+    });
+  }
+  q('cToday').textContent = s.totals.today;
+  q('cTotal').textContent = s.totals.logs;
+  q('cUsers').textContent = s.totals.users;
+  q('cDev').textContent   = s.totals.devices;
+  q('hdrPort').textContent = 'port ' + s.port + ' - ' + (s.tz || 'local time');
   q('hdrTick').textContent = 'updated ' + new Date().toLocaleTimeString();
-  q('hdrTick').className = 'badge';
 
-  var cls = t.online ? 'on' : (t.devices ? 'off' : 'warn');
-  var txt = t.online ? (t.online + ' device' + (t.online > 1 ? 's' : '') + ' online')
-    : (t.devices ? 'device offline' : 'no device');
-  q('hdrDev').className = 'badge ' + cls;
-  q('hdrDev').innerHTML = '<span class="dot ' + cls + '"></span>' + txt;
+  var online = s.devices.filter(function(d){ return d.online; });
+  var h = q('hdrDev');
+  h.textContent = online.length ? online.length + ' device online' : (s.devices.length ? 'device offline' : 'no device');
+  h.className = 'badge ' + (online.length ? 'on' : (s.devices.length ? 'off' : ''));
 
-  q('nLogs').textContent  = num(t.logs);
-  q('nUsers').textContent = num(t.users);
-  q('nDev').textContent   = num(t.devices);
-  q('nQueue').textContent = num(t.queued);
-
-  q('cToday').textContent  = num(t.today);
-  q('cTotal').textContent  = num(t.logs);
-  q('cUsers').textContent  = num(t.users);
-  q('cDev').textContent    = t.online + ' / ' + t.devices;
-  q('cTodayS').textContent = new Date().toDateString();
-  q('cTotalS').textContent = 'since the server first ran';
-  q('cDevS').textContent   = t.devices ? (t.online ? 'reporting normally' : 'nothing polling') : 'none configured';
-
-  syncDevicePickers(s.devices || []);
-
-  if (s.checks) {
-    var bad = s.checks.filter(function(c){ return c.level !== 'ok'; }).length;
-    q('nChk').textContent = bad ? String(bad) : 'ok';
-    if (TAB === 'overview') q('ovChecks').innerHTML = checksHtml(s.checks.slice(0, 4));
-    if (TAB === 'diagnostics') q('diagChecks').innerHTML = checksHtml(s.checks);
+  // devices
+  if (!s.devices.length) {
+    q('devBox').innerHTML = '<div class="hint">No device has connected yet. Configure the ADMS / Cloud Server settings shown below, then reboot the terminal.</div>';
+  } else {
+    q('devBox').innerHTML = s.devices.map(function(d){
+      var i = d.info || {};
+      return '<div style="margin-bottom:12px">'
+        + '<div class="row" style="justify-content:space-between"><b class="mono">' + esc(d.sn) + '</b>'
+        + '<span class="badge ' + (d.online?'on':'off') + '">' + (d.online?'online':'offline') + '</span></div>'
+        + '<div class="hint" style="margin-top:6px">'
+        + 'IP <b>' + esc(d.ip||'?') + '</b><br>'
+        + 'Model <b>' + esc((i.DeviceName || i['~DeviceName'] || 'AIFACE-MARS').split(',')[0]) + '</b>'
+        + ' <span class="hint">' + esc(i.Platform || '') + '</span><br>'
+        + 'LAN IP <b>' + esc(i.IPAddress || '?') + '</b> &middot; MAC <b>' + esc(i.MAC || '?') + '</b><br>'
+        + 'Firmware <b>' + esc(i.FWVersion || i['~ZKFPVersion'] || '?') + '</b><br>'
+        + 'Faces <b>' + esc(i.FaceCount || i.face_count || '?') + '</b> &middot; '
+        + 'Users <b>' + esc(i.UserCount || i.user_count || '?') + '</b> &middot; '
+        + 'Logs <b>' + esc(i.TransactionCount || i.transaction_count || '?') + '</b><br>'
+        + 'Last contact <b>' + (d.lastSeen ? ago(d.lastSeen) : 'never') + '</b><br>'
+        + (d.clockOffset
+            ? 'Terminal clock <b>' + Math.abs(d.clockOffset) + ' min '
+              + (d.clockOffset > 0 ? 'behind' : 'ahead') + '</b> &middot; punches corrected to Indian time'
+            : 'Terminal clock <b>in step</b> with Indian time')
+        + '</div>'
+        + '<div class="row" style="margin-top:6px;align-items:center">'
+        + '<span class="hint">Gate role</span>'
+        + '<select data-sn="' + esc(d.sn) + '" onchange="setRole(this.dataset.sn, this.value)">'
+        + '<option value=""' + (d.role ? '' : ' selected') + '>Unassigned</option>'
+        + '<option value="in"' + (d.role === 'in' ? ' selected' : '') + '>Check-in terminal</option>'
+        + '<option value="out"' + (d.role === 'out' ? ' selected' : '') + '>Check-out terminal</option>'
+        + '</select></div></div>';
+    }).join('');
   }
-  if (s.logs)   { renderRows(s.logs); }
-  if (s.users)  { renderUsers(); }
-  if (s.queue)  { renderQueue(s.queue); }
-  if (s.events) { renderTrace(); }
-  if (TAB === 'devices') renderDevices(s.devices || []);
-  if (TAB === 'diagnostics') renderSetup(s);
-}
 
-function checksHtml(list){
-  if (!list.length) return '<div class="empty">No checks ran.</div>';
-  return list.map(function(c){
-    var mark = c.level === 'ok' ? '✓' : (c.level === 'warn' ? '!' : '✕');
-    return '<div class="chk ' + c.level + '"><div class="ic">' + mark + '</div><div>'
-      + '<div class="t">' + esc(c.title) + '</div>'
-      + '<div class="d">' + esc(c.detail) + '</div>'
-      + (c.fix ? '<div class="fx">' + esc(c.fix) + '</div>' : '')
-      + '</div></div>';
-  }).join('');
-}
-
-function rowHtml(r, withDev){
-  var st = LAB.status[r.status] || ('Status ' + r.status);
-  var c = (r.status === 1 || r.status === 5) ? 'out'
-        : ((r.status === 0 || r.status === 4) ? 'in' : '');
-  return '<tr><td class="mono">' + esc(r.time) + '</td>'
-    + '<td class="mono">' + esc(r.pin) + '</td>'
-    + '<td>' + (r.name ? esc(r.name) : '<span style="color:#5d6a7a">&mdash;</span>') + '</td>'
-    + '<td><span class="pill ' + c + '">' + esc(st) + '</span></td>'
-    + '<td>' + esc(LAB.verify[r.verify] || ('Mode ' + r.verify)) + '</td>'
-    + (withDev ? '<td class="mono" style="color:#5d6a7a">' + esc(r.sn) + '</td>' : '') + '</tr>';
-}
-
-function renderRows(logs){
-  if (TAB === 'overview') {
-    q('tbRecent').innerHTML = logs.map(function(r){ return rowHtml(r, false); }).join('');
-    q('emptyRecent').style.display = logs.length ? 'none' : 'block';
-  } else if (TAB === 'attendance') {
-    q('tbLogs').innerHTML = logs.map(function(r){ return rowHtml(r, true); }).join('');
-    q('emptyLogs').style.display = logs.length ? 'none' : 'block';
-    q('logCount').textContent = logs.length < S.logCount
-      ? ('showing ' + num(logs.length) + ' of ' + num(S.logCount))
-      : (num(logs.length) + ' rows');
+  // logs
+  var tb = '';
+  for (var i = 0; i < s.logs.length; i++) {
+    var r = s.logs[i];
+    var st = r.dir === 'in' ? 'Check-in' : r.dir === 'out' ? 'Check-out'
+           : (LAB.status[r.status] || ('Status ' + r.status));
+    var cls = r.dir || '';
+    var f = fmtStamp(r.time);
+    tb += '<tr><td class="mono">' + esc(f.date) + ' <b>' + esc(f.time) + '</b></td>'
+       + '<td class="mono">' + esc(r.pin) + '</td>'
+       + '<td>' + (esc(r.name) || '<span style="color:#8b949e">&mdash;</span>') + '</td>'
+       + '<td><span class="pill ' + cls + '">' + esc(st) + '</span>'
+       + (r.taps > 1 ? ' <span class="tag">' + r.taps + ' taps</span>' : '') + '</td>'
+       + '<td>' + esc(LAB.verify[r.verify] || ('Mode ' + r.verify)) + '</td>'
+       + '<td class="mono" style="color:#8b949e">' + esc(r.sn) + '</td></tr>';
   }
-}
+  q('tbLogs').innerHTML = tb;
+  q('emptyLogs').style.display = s.logs.length ? 'none' : 'block';
 
-function renderUsers(){
-  var list = S.users || [];
-  var term = (q('uq').value || '').toLowerCase();
-  if (term) list = list.filter(function(u){
-    return String(u.pin).toLowerCase().indexOf(term) >= 0
-      || String(u.name || '').toLowerCase().indexOf(term) >= 0;
-  });
-  var PRI = {'0':'User','2':'Enroller','6':'Manager','14':'Super admin'};
-  q('tbUsers').innerHTML = list.map(function(u){
+  PEOPLE = s.users;
+  if (!q('aTo').value && !ATT_SEEDED){
+    ATT_SEEDED = true;
+    setRange('att', 0);               // open on everyone, today
+  }
+
+  // users
+  var ub = '';
+  for (var j = 0; j < s.users.length; j++) {
+    var u = s.users[j];
     var bio = u.bio ? Object.keys(u.bio).join(', ') : '';
-    return '<tr><td class="mono">' + esc(u.pin) + '</td>'
-      + '<td>' + esc(u.name || '') + '</td>'
-      + '<td class="mono">' + esc(u.card || '') + '</td>'
-      + '<td>' + esc(PRI[u.privilege] || u.privilege || 'User') + '</td>'
-      + '<td style="color:#5d6a7a">' + esc(bio) + '</td>'
-      + '<td style="text-align:right"><button onclick="editUser('
-      + esc(JSON.stringify(String(u.pin))) + ')">Edit</button></td></tr>';
-  }).join('');
-  q('emptyUsers').style.display = list.length ? 'none' : 'block';
-  if (term && !list.length) q('emptyUsers').textContent = 'No user matches "' + term + '".';
-}
+    var pri = {'0':'User','2':'Enroller','6':'Manager','14':'Super admin'}[u.privilege] || u.privilege || 'User';
+    ub += '<tr><td class="mono">' + esc(u.pin) + '</td><td>' + esc(u.name) + '</td>'
+       + '<td class="mono">' + esc(u.card || '') + '</td><td>' + esc(pri) + '</td>'
+       + '<td style="color:#8b949e">' + esc(bio) + '</td></tr>';
+  }
+  q('tbUsers').innerHTML = ub;
+  q('emptyUsers').style.display = s.users.length ? 'none' : 'block';
 
-function editUser(pin){
-  var u = (S.users || []).filter(function(x){ return String(x.pin) === String(pin); })[0];
-  if (!u) return;
-  q('uPin').value = u.pin;
-  q('uName').value = u.name || '';
-  q('uCard').value = u.card || '';
-  q('uPri').value = u.privilege || '0';
-  q('uPin').focus();
-}
-
-function renderDevices(devs){
-  if (!devs.length) { q('devList').innerHTML = ''; q('devEmpty').style.display = 'block'; return; }
-  q('devEmpty').style.display = 'none';
-  q('devList').innerHTML = devs.map(function(d){
-    var st = d.online ? 'on' : 'off';
-    var health = d.online
-      ? 'Polling every ~' + Math.round((d.pollInterval || 10000) / 1000) + 's'
-      : 'Silent for ' + (d.silentFor ? dur(d.silentFor / 1000) : 'ever');
-    var pairs = [
-      ['Serial', d.sn], ['Model', d.name || 'AIFACE-MARS'], ['Firmware', d.firmware || '?'],
-      ['Platform', d.platform || '?'], ['Push protocol', d.push || '?'],
-      ['Address seen by server', d.ip || '?'], ['Address on device', d.deviceIp || '?'],
-      ['MAC', d.mac || '?'],
-      ['Users on device', (d.userCount || '?') + (d.maxUsers ? ' / ' + d.maxUsers : '')],
-      ['Faces enrolled', (d.faceCount || '?') + (d.maxFaces ? ' / ' + d.maxFaces : '')],
-      ['Fingerprints', d.fpCount || '?'],
-      ['Transactions on device', d.transactions || '?'],
-      ['Punches received here', num(d.pushCount)],
-      ['Last punch received', d.lastPush ? ago(d.lastPush) : 'none'],
-      ['Last contact', ago(d.lastSeen)],
-      ['First seen', d.firstSeen ? new Date(d.firstSeen).toLocaleString() : '?'],
-      ['Polls received', num(d.polls)],
-      ['Connections', num(d.sessions) + (d.drops ? ' (' + d.drops + ' drop' + (d.drops > 1 ? 's' : '') + ')' : '')],
-      ['Last drop', d.lastDrop ? ago(d.lastDrop) : 'none'],
-      ['Commands sent / confirmed', num(d.cmdsSent) + ' / ' + num(d.cmdsDone)],
-      ['Log pointer', d.stamp + ' / ' + d.opStamp]
-    ];
-    return '<div class="panel"><h2>'
-      + '<span><span class="dot ' + st + '"></span>' + esc(d.sn)
-      + (d.name ? ' · ' + esc(d.name) : '') + '</span>'
-      + '<span class="row"><span class="badge ' + st + '">' + (d.online ? 'online' : 'offline')
-      + '</span><span class="badge">' + esc(health) + '</span>'
-      + '<button onclick="cmd(&quot;info&quot;,{sn:' + esc(JSON.stringify(d.sn)) + '})">Refresh info</button>'
-      + '</span></h2><div class="body"><dl class="kv">'
-      + pairs.map(function(p){
-          return '<dt>' + esc(p[0]) + '</dt><dd>' + esc(p[1]) + '</dd>'; }).join('')
-      + '</dl>'
-      + (d.infoCount ? '' : '<p class="hint" style="margin:11px 0 0">This terminal has not '
-        + 'sent its option list yet, so the hardware details above are unknown. Press '
-        + '<b>Refresh info</b>.</p>')
-      + '</div></div>';
-  }).join('');
-}
-
-function renderQueue(list){
-  q('tbQueue').innerHTML = list.map(function(c){
-    var st = c.returned ? 'done (ret ' + c.result + ')'
-           : (c.sent ? 'sent, awaiting reply' : 'pending');
-    var cl = c.returned ? (String(c.result) === '0' ? 'in' : '') : (c.sent ? '' : 'out');
-    return '<tr><td class="mono">' + c.id + '</td>'
-      + '<td class="mono">' + esc(c.cmd.split('\\t')[0]) + '</td>'
-      + '<td><span class="pill ' + cl + '">' + esc(st) + '</span></td></tr>';
-  }).join('');
-  q('emptyQueue').style.display = list.length ? 'none' : 'block';
-}
-
-function renderTrace(){
-  var ev = S.events || [];
-  var term = (q('tq').value || '').toLowerCase();
-  if (term) ev = ev.filter(function(e){
-    return (e.msg + ' ' + e.sn + ' ' + e.kind).toLowerCase().indexOf(term) >= 0; });
-  q('trace').innerHTML = ev.map(function(e){
+  // trace
+  q('trace').innerHTML = s.events.map(function(e){
     return '<div class="' + e.kind + '">' + new Date(e.t).toLocaleTimeString()
       + ' [' + esc(e.sn) + '] ' + esc(e.msg) + '</div>';
   }).join('') || '<div class="info">no traffic yet</div>';
-}
 
-function renderSetup(s){
+  // queue
+  q('queue').innerHTML = s.queue.map(function(c){
+    var st = c.returned ? ('done (ret ' + c.result + ')') : (c.sent ? 'sent, awaiting reply' : 'pending');
+    var col = c.returned ? 'srv' : (c.sent ? 'info' : 'dev');
+    return '<div class="' + col + '">#' + c.id + ' ' + esc(c.cmd.split('\\t')[0]) + ' &mdash; ' + st + '</div>';
+  }).join('') || '<div class="info">queue empty</div>';
+
+  // setup help
   var ip = s.ips[0] || 'YOUR-PC-IP';
   q('setup').innerHTML =
     'On the terminal: <b>Menu &rarr; COMM &rarr; Cloud Server Setting (ADMS)</b><br><br>'
@@ -1597,96 +1857,689 @@ function renderSetup(s){
     + 'Server Port <code>' + s.port + '</code><br>'
     + 'Enable Domain Name <code>OFF</code><br>'
     + 'Enable Proxy Server <code>OFF</code><br><br>'
-    + 'Save, then reboot the terminal. It should appear here within about a minute.'
-    + (s.ips.length > 1 ? '<br><br>This machine has several addresses &mdash; use the one on '
-      + 'the same subnet as the terminal: <code>' + esc(s.ips.join('  ')) + '</code>' : '');
-  q('srvInfo').innerHTML = [
-    ['Listening on', 'port ' + s.port],
-    ['Addresses', s.ips.join(', ') || 'localhost only'],
-    ['Uptime', dur(s.uptime)],
-    ['Punches stored', num(s.totals.logs)],
-    ['Users stored', num(s.totals.users)],
-    ['Health endpoint', location.origin + '/health']
-  ].map(function(p){ return '<dt>' + esc(p[0]) + '</dt><dd>' + esc(p[1]) + '</dd>'; }).join('');
+    + 'Save and reboot the device. Detected addresses on this machine: <code>'
+    + esc(s.ips.join('  ')) + '</code>';
 }
 
-function syncDevicePickers(devs){
-  var opts = '<option value="">All devices</option>' + devs.map(function(d){
-    return '<option value="' + esc(d.sn) + '">' + esc(d.sn)
-      + (d.online ? '' : ' (offline)') + '</option>'; }).join('');
-  ['fdev', 'cmdTarget'].forEach(function(id){
-    var el = q(id);
-    if (el.getAttribute('data-sig') === opts) return;
-    var keep = el.value;
-    el.innerHTML = opts;
-    el.value = keep;
-    el.setAttribute('data-sig', opts);
-  });
+var toastTimer = null;
+function toast(msg, cls){
+  var el = q('toast');
+  if (!el){ el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
+  el.className = 'toast ' + (cls || '');
+  el.innerHTML = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ el.remove(); }, 6000);
 }
 
-/* ---------------- actions ---------------- */
+function doorState(cls, msg){
+  var b = q('bigDoor');
+  if (b) b.className = 'door ' + (cls || '');
+  var m = q('doorMsg');
+  if (m) m.innerHTML = msg;
+  if (cls === 'ok' || cls === 'bad') setTimeout(function(){
+    if (q('bigDoor')) q('bigDoor').className = 'door';
+  }, 5000);
+}
+
+// The terminal collects commands on its next poll and answers separately, so
+// the button waits for that answer instead of claiming success immediately.
+function openDoor(){
+  toast('Sending to the terminal&hellip;');
+  doorState('busy', 'Sending&hellip;');
+  fetch('/api/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({kind:'unlock'})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok){ doorState('bad', esc(j.error || 'failed')); return toast(esc(j.error || 'failed'), 'bad'); }
+      var ids = j.queued.map(function(c){ return c.id; });
+      var m = 'Queued for ' + j.targets.length + ' terminal(s), waiting for a reply&hellip;';
+      toast(m); doorState('busy', m);
+      pollDoor(ids, Date.now() + 30000);
+    })
+    .catch(function(){ doorState('bad', 'Server unreachable'); toast('Server unreachable', 'bad'); });
+}
+function pollDoor(ids, deadline){
+  fetch('/api/cmd/status?ids=' + ids.join(','))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      var all = j.items.concat(j.followups);
+      if (all.some(function(c){ return c.ok === true; })){
+        // all the protocol tells us is that the command was accepted
+        var m = 'Terminal accepted the unlock. If the door did not move, the lock is not '
+          + 'wired to this terminal or its Door Lock Delay is 0 &mdash; see Door diagnostics.';
+        doorState('ok', m);
+        return toast('Unlock accepted by the terminal.', 'ok');
+      }
+      // a rejected wording spawns a retry; keep waiting while one is in flight
+      var pending = !all.length || all.some(function(c){ return c.ok === null; });
+      if (!pending){
+        var last = all[all.length-1];
+        var b = 'The terminal refused every unlock wording (last reply <b>'
+          + esc(String(last && last.result)) + '</b>). Run <b>Try every unlock form</b> below.';
+        doorState('bad', b);
+        return toast(b, 'bad');
+      }
+      if (Date.now() > deadline){
+        var t = 'No answer in 30s &mdash; the terminal is offline, or it connects but never '
+          + 'collects commands. Check Door diagnostics.';
+        doorState('bad', t);
+        return toast(t, 'bad');
+      }
+      setTimeout(function(){ pollDoor(ids, deadline); }, 1000);
+    })
+    .catch(function(){ doorState('bad', 'Server unreachable'); toast('Server unreachable', 'bad'); });
+}
+
+function loadDoor(){
+  fetch('/api/door/log').then(function(r){ return r.json(); }).then(function(j){
+    var on = j.devices.filter(function(d){ return d.online; });
+    q('doorDev').innerHTML = j.devices.map(function(d){
+      return '<div class="row" style="justify-content:space-between;padding:5px 0">'
+        + '<span class="mono">' + esc(d.sn) + '</span>'
+        + '<span class="row" style="gap:6px">'
+        + '<span class="tag">' + (d.lastCmd ? 'collects commands' : 'never collected a command') + '</span>'
+        + (d.unlockCmd ? '<span class="tag face">accepts ' + esc(d.unlockCmd.split(' ')[0]) + '</span>' : '')
+        + '<span class="badge ' + (d.online ? 'on' : 'off') + '">'
+        + (d.online ? 'online' : 'offline') + '</span></span></div>';
+    }).join('') || '<div class="note">No terminal has ever connected.</div>';
+    if (!on.length) q('doorDev').innerHTML += '<div class="note" style="margin-top:8px;color:var(--bad)">'
+      + 'Nothing is online, so no command can reach a door right now.</div>';
+
+    q('tbDoor').innerHTML = j.items.map(function(c){
+      var reply = c.returned
+        ? '<b style="color:' + (c.ok ? 'var(--ok)' : 'var(--bad)') + '">' + esc(String(c.result)) + '</b>'
+          + (c.ok ? ' accepted' : ' refused')
+        : (c.sent ? '<span style="color:var(--warn)">no reply yet</span>'
+                  : '<span style="color:var(--dim)">not collected</span>');
+      return '<tr><td class="mono">' + new Date(c.created).toLocaleTimeString() + '</td>'
+        + '<td class="mono" style="color:#8b949e">' + esc(c.sn.slice(-4)) + '</td>'
+        + '<td class="mono">' + esc(c.cmd) + (c.probe ? ' <span class="tag">test</span>' : '') + '</td>'
+        + '<td>' + (c.sent ? new Date(c.sent).toLocaleTimeString() : '&mdash;') + '</td>'
+        + '<td>' + reply + '</td></tr>';
+    }).join('');
+    q('emptyDoor').style.display = j.items.length ? 'none' : 'block';
+  }).catch(function(){});
+}
+
+function doorProbe(){
+  if (!confirm('Send every unlock wording to each online terminal once?\\n\\n'
+    + 'If one of them works the door will open during the test.')) return;
+  fetch('/api/door/probe', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok) return toast(esc(j.error || 'failed'), 'bad');
+      toast('Sent ' + j.queued.length + ' test command(s). Replies appear below within '
+        + 'a few seconds of each terminal polling.');
+      setTimeout(loadDoor, 1200);
+    });
+}
+
 function cmd(kind, extra, confirmMsg){
   if (confirmMsg && !confirm(confirmMsg)) return;
   var payload = Object.assign({kind: kind}, extra || {});
-  if (!payload.sn) {
-    var t = q('cmdTarget');
-    if (t && t.value) payload.sn = t.value;
-  }
-  fetch('/api/cmd', {method: 'POST', headers: {'Content-Type': 'application/json'},
+  fetch('/api/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(payload)})
     .then(function(r){ return r.json(); })
-    .then(function(j){
-      if (!j.ok) return toast(j.error || 'Command failed', 'bad');
-      toast(j.warning || ('Queued: ' + j.cmd.split('\\t')[0]), j.warning ? '' : 'good');
-      refresh(true);
-    })
-    .catch(function(){ toast('Could not reach the server', 'bad'); });
-}
-function sendRaw(){
-  var v = q('rawCmd').value.trim();
-  if (!v) return;
-  cmd('raw', {cmd: v});
-  q('rawCmd').value = '';
+    .then(function(j){ if (!j.ok) alert(j.error || 'failed'); refresh(); });
 }
 function addUser(){
   var pin = q('uPin').value.trim();
-  if (!pin) return toast('PIN is required', 'bad');
-  cmd('adduser', {pin: pin, name: q('uName').value.trim(),
-    card: q('uCard').value.trim(), pri: q('uPri').value});
+  if (!pin) return alert('PIN is required');
+  cmd('adduser', {pin: pin, name: q('uName').value.trim(), card: q('uCard').value.trim(), pri: q('uPri').value});
   q('uName').value = ''; q('uCard').value = '';
 }
 function delUser(){
   var pin = q('uPin').value.trim();
-  if (!pin) return toast('PIN is required', 'bad');
+  if (!pin) return alert('PIN is required');
   if (!confirm('Delete user ' + pin + ' from the device?')) return;
   cmd('deluser', {pin: pin});
 }
 function purge(){
   if (!confirm('Delete all attendance history stored on this server? The device keeps its own copy.')) return;
-  fetch('/api/purge', {method: 'POST'})
-    .then(function(){ toast('Server history cleared', 'good'); refresh(true); })
-    .catch(function(){ toast('Could not reach the server', 'bad'); });
+  fetch('/api/purge', {method:'POST'}).then(refresh);
 }
-function clearFilters(){
-  q('fq').value = ''; q('ffrom').value = ''; q('fto').value = '';
-  q('fdev').value = ''; q('flimit').value = '300';
-  refresh(true);
+function setRole(sn, role){
+  fetch('/api/role', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ sn: sn, role: role }) }).then(refresh);
 }
-function exportCsv(){
-  var p = params();
-  p.delete('tab');
-  p.set('limit', '20000');
-  window.location = '/api/export.csv?' + p.toString();
+var ATT = null, PEOPLE = [], FACE = 1;
+function hm(m){ return (m/60|0) + 'h ' + (m%60) + 'm'; }
+function setFace(on){
+  FACE = on ? 1 : 0;
+  q('aFace1').className = on ? 'on' : '';
+  q('aFace0').className = on ? '' : 'on';
+  q('aRule').textContent = on ? 'Face verified only' : 'Every verification mode';
+  q('aRule').className = on ? 'tag face' : 'tag';
+  loadAtt();
+}
+function bytes(b){
+  var u = ['B','KB','MB','GB'], i = 0;
+  while (b >= 1024 && i < u.length-1){ b /= 1024; i++; }
+  return (i ? b.toFixed(1) : b) + ' ' + u[i];
 }
 
-/* ---------------- boot ---------------- */
-(function(){
-  var t = location.hash.slice(1);
-  if (!t) { try { t = localStorage.getItem('aiface.tab') || ''; } catch (e) {} }
-  var valid = ['overview','attendance','users','devices','commands','diagnostics'];
-  go(valid.indexOf(t) >= 0 ? t : 'overview');
-  schedule();
-})();
+function pickOpen(){ pickFilter(); q('aList').style.display = 'block'; }
+function pickFilter(){
+  // the box no longer matches the pinned employee, so fall back to everyone
+  if (q('aUser').value && q('aSearch').value.indexOf('PIN ' + q('aUser').value) < 0){
+    q('aUser').value = ''; loadAtt();
+  }
+  var t = q('aSearch').value.toLowerCase();
+  var hits = PEOPLE.filter(function(u){
+    return !t || (u.name||'').toLowerCase().indexOf(t) > -1 || String(u.pin).indexOf(t) > -1;
+  }).slice(0, 60);
+  var all = '<div class="opt" data-pin="" data-name=""'
+    + ' style="padding:9px 12px;cursor:pointer;border-bottom:1px solid #1c222b">'
+    + '<b>Everyone</b> <span class="hint">all ' + PEOPLE.length + ' employees</span></div>';
+  q('aList').innerHTML = all + (hits.length ? hits.map(function(u){
+    return '<div class="opt" data-pin="' + esc(u.pin) + '" data-name="' + esc(u.name||'') + '"'
+      + ' style="padding:9px 12px;cursor:pointer;border-bottom:1px solid #1c222b">'
+      + '<b>' + (esc(u.name) || '(no name)') + '</b>'
+      + ' <span class="hint">PIN ' + esc(u.pin) + '</span></div>';
+  }).join('') : '<div class="hint" style="padding:10px 12px">No match</div>');
+  q('aList').style.display = 'block';
+}
+function pickChoose(pin, name){
+  q('aUser').value = pin || '';
+  q('aSearch').value = !pin ? '' : (name ? name + '  -  PIN ' + pin : 'PIN ' + pin);
+  q('aList').style.display = 'none';
+  loadAtt();
+}
+document.addEventListener('click', function(e){
+  if (e.target.closest && e.target.closest('.opt')){
+    var o = e.target.closest('.opt');
+    return pickChoose(o.dataset.pin, o.dataset.name);
+  }
+  if (!e.target.closest || !e.target.closest('#aList,#aSearch')) {
+    var l = q('aList'); if (l) l.style.display = 'none';
+  }
+});
+
+function loadAtt(){
+  var pin = q('aUser').value;
+  var p = new URLSearchParams({from:q('aFrom').value, to:q('aTo').value, face:FACE});
+  if (pin) p.set('pin', pin);
+  fetch('/api/attendance?' + p.toString())
+    .then(function(r){ return r.json(); })
+    .then(pin ? renderAtt : renderEveryone)
+    .catch(function(){ q('emptyAtt').textContent = 'Could not load attendance.'; });
+}
+
+// No employee picked: one row per person for the same window, same rules.
+function renderEveryone(a){
+  ATT = { everyone: true, from: a.from, to: a.to, rows: a.rows };
+  var worked = a.rows.filter(function(r){ return r.totals.present; });
+  var sum = function(k){ return a.rows.reduce(function(x,r){ return x + r.totals[k]; }, 0); };
+  q('aKpis').innerHTML = '<div class="grid">'
+    + kpi('Employees', a.rows.length)
+    + kpi('With attendance', worked.length, worked.length ? 'var(--ok)' : '')
+    + kpi('Days in range', a.rows.length ? a.rows[0].totals.totalDays : 0)
+    + kpi('Present days', sum('present'), 'var(--ok)')
+    + kpi('Total hours', hm(sum('totalMin')))
+    + kpi('Break', hm(sum('breakMin')), 'var(--warn)')
+    + '</div>';
+  q('attTable').querySelector('thead').innerHTML =
+    '<tr><th>PIN</th><th>Name</th><th>Present</th><th>Absent</th>'
+    + '<th>Total</th><th>Break</th><th>Net hours</th></tr>';
+  q('tbAtt').innerHTML = a.rows.map(function(r){
+    var t = r.totals;
+    return '<tr style="cursor:pointer" onclick="pickChoose(' + JSON.stringify(String(r.pin))
+      + ',' + JSON.stringify(r.name || '') + ')">'
+      + '<td class="mono">' + esc(r.pin) + '</td>'
+      + '<td>' + (esc(r.name) || '<span style="color:#8b949e">&mdash;</span>') + '</td>'
+      + '<td class="num" style="color:' + (t.present ? 'var(--ok)' : 'var(--dim)') + '">'
+      + t.present + '</td>'
+      + '<td class="num" style="color:' + (t.absent ? 'var(--bad)' : 'var(--dim)') + '">'
+      + t.absent + '</td>'
+      + '<td class="num">' + hm(t.totalMin) + '</td>'
+      + '<td class="num"' + (t.breakMin ? ' style="color:var(--warn)"' : '') + '>'
+      + hm(t.breakMin) + '</td>'
+      + '<td class="num"><b>' + hm(t.workMin) + '</b></td></tr>';
+  }).join('');
+  q('emptyAtt').style.display = a.rows.length ? 'none' : 'block';
+  q('emptyAtt').textContent = 'No employees synced from the terminal yet.';
+  q('aFoot').innerHTML = 'Every employee, ' + esc(a.from) + ' to ' + esc(a.to) + ', counting '
+    + (a.verifiedBy === 'face' ? '<b>face-verified punches only</b>' : 'every verification mode')
+    + '. Click a row to open that person\u2019s daily log.';
+}
+
+function renderAtt(a){
+  ATT = a;
+  var t = a.totals;
+  q('aKpis').innerHTML = '<div class="grid">'
+    + kpi('Total days', t.totalDays) + kpi('Present', t.present, 'var(--ok)')
+    + kpi('Absent', t.absent, t.absent ? 'var(--bad)' : '') + kpi('Sundays', t.sundays)
+    + kpi('Total hours', hm(t.totalMin)) + kpi('Break', hm(t.breakMin), 'var(--warn)')
+    + kpi('Net hours', hm(t.workMin), 'var(--accent)') + '</div>';
+
+  q('attTable').querySelector('thead').innerHTML =
+    '<tr><th>Date</th><th>Status</th><th>Check-in &ndash; Check-out</th>'
+    + '<th>Total</th><th>Break</th><th>Net hours</th><th>Movements</th></tr>';
+
+  var tb = '';
+  for (var i = 0; i < a.days.length; i++){
+    var d = a.days[i];
+    var f = fmtStamp(d.date);
+    var col = d.status === 'Present' ? 'var(--ok)' : d.status === 'Absent' ? 'var(--bad)' : 'var(--dim)';
+    var span = d.in && d.out ? '<span class="t">' + fmtStamp(d.in).time + '</span> &ndash; <span class="t">'
+                 + fmtStamp(d.out).time + '</span>'
+             : d.in ? '<span class="t">' + fmtStamp(d.in).time
+                 + '</span> &ndash; <span style="color:var(--warn)">seen once only</span>'
+             : '<span style="color:#8b949e">Not marked</span>';
+    tb += '<tr style="cursor:pointer" onclick="openDay(' + i + ')">'
+       + '<td>' + esc(f.date) + '</td>'
+       + '<td style="color:' + col + '">' + esc(d.status)
+       + (d.incomplete ? ' <span class="tag">no check-out</span>' : '') + '</td>'
+       + '<td>' + span + '</td>'
+       + '<td class="num">' + hm(d.totalMin) + '</td>'
+       + '<td class="num"' + (d.breakMin ? ' style="color:var(--warn)"' : '') + '>' + hm(d.breakMin)
+       + (d.breaks && d.breaks.length > 1 ? ' <span class="hint">(' + d.breaks.length + ')</span>' : '')
+       + '</td>'
+       + '<td class="num"><b>' + hm(d.workMin) + '</b></td>'
+       + '<td class="num" style="color:#8b949e">' + d.punches
+       + (d.ignored ? ' <span class="hint">+' + d.ignored + ' other</span>' : '') + '</td></tr>';
+  }
+  q('tbAtt').innerHTML = tb;
+  q('emptyAtt').style.display = a.days.length ? 'none' : 'block';
+  q('emptyAtt').textContent = 'No days in this range.';
+  q('aFoot').innerHTML = 'Counting '
+    + (a.verifiedBy === 'face' ? '<b>face-verified punches only</b>' : 'every verification mode')
+    + '. A day reads first movement in, last movement out, and the pairs between them as breaks; '
+    + 'repeat taps at the same gate are folded into one movement.'
+    + (t.ignored ? ' <b>' + t.ignored + '</b> card or fingerprint punch(es) in this range were not counted.' : '');
+}
+function kpi(k, v, col){
+  return '<div class="card"><div class="k">' + k + '</div><div class="v"'
+    + (col ? ' style="color:' + col + '"' : '') + '>' + v + '</div></div>';
+}
+
+var STEP = {'Check in':'a','Check out':'z','Break start':'bs','Break end':'be','Extra punch':'x'};
+// what the gap before this movement means: at work, or away from it
+var GAP = {'Break end':['Away on break','var(--warn)'],
+           'Check out':['At work','var(--ok)'],
+           'Break start':['At work','var(--ok)'],
+           'Extra punch':['','']};
+
+function openDay(i){
+  var d = ATT.days[i];
+  q('mTitle').textContent = (ATT.name || ('PIN ' + ATT.pin)) + '  -  ' + fmtStamp(d.date).date;
+  q('mDate').innerHTML = d.events.length
+    ? '<b style="color:var(--fg)">' + hm(d.workMin) + '</b> worked &middot; '
+      + hm(d.totalMin) + ' on site &middot; ' + hm(d.breakMin) + ' break &middot; '
+      + d.punches + ' movement' + (d.punches === 1 ? '' : 's')
+      + (d.taps > d.punches ? ' from ' + d.taps + ' taps' : '')
+      + (d.ignored ? ' &middot; ' + d.ignored + ' non-face punch(es) skipped' : '')
+    : 'Nothing recorded on this day.';
+
+  if (!d.events.length){
+    q('mBody').innerHTML = '<div class="empty">No face punches on this day.</div>';
+  } else {
+    var html = '<div class="tl">';
+    for (var k = 0; k < d.events.length; k++){
+      var e = d.events[k], prev = d.events[k-1];
+      if (prev){
+        var mins = Math.round((new Date(e.time.replace(' ','T')) - new Date(prev.time.replace(' ','T')))/60000);
+        // an unmatched tap gets the elapsed time but no claim about where
+        // the person was, because that is exactly what we do not know
+        var g = GAP[e.label] || ['',''];
+        html += '<div class="gap">&#9474;&nbsp; ' + hm(Math.max(0,mins))
+          + (g[0] ? ' <span style="color:' + g[1] + '">' + g[0] + '</span>' : '') + '</div>';
+      }
+      var f = fmtStamp(e.time);
+      html += '<div class="ev ' + (STEP[e.label] || 'x') + '">'
+        + '<div><b>' + esc(e.label) + '</b> <span class="t" style="color:var(--dim)">'
+        + esc(f.time) + '</span>'
+        + (e.taps > 1 ? ' <span class="tag">' + e.taps + ' taps, first ' + esc(fmtStamp(e.from).time) + '</span>' : '')
+        + '</div>'
+        + '<div class="hint">' + esc(LAB.verify[e.verify] || ('mode ' + e.verify))
+        + ' &middot; gate ' + esc(e.sn) + '</div></div>';
+    }
+    html += '</div>';
+    if (d.events.length === 1) html += '<div class="note" style="padding:0 0 12px">'
+      + 'Only one movement, so there is nothing to close the day against &mdash; '
+      + 'no hours are counted.</div>';
+    q('mBody').innerHTML = html;
+  }
+  q('modal').style.display = 'block';
+}
+function closeModal(e){ if (!e || e.target === q('modal')) q('modal').style.display = 'none'; }
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeModal(); });
+
+function attCsv(){
+  if (!ATT) return;
+  var rows, name;
+  if (ATT.everyone){
+    name = 'all-employees-' + ATT.from + '-to-' + ATT.to;
+    rows = [['PIN','Name','Days','Present','Absent','Total','Break','Net hours']];
+    ATT.rows.forEach(function(r){
+      var t = r.totals;
+      rows.push([r.pin, r.name, t.totalDays, t.present, t.absent,
+                 hm(t.totalMin), hm(t.breakMin), hm(t.workMin)]);
+    });
+  } else {
+    name = 'attendance-' + (ATT.name || ATT.pin);
+    rows = [['Date','Status','Check in','Break start','Break end','Check out',
+             'Total','Break','Net hours','Movements']];
+    ATT.days.forEach(function(d){
+      var b = (d.breaks || []).map(function(x){ return fmtStamp(x.from).time; }).join(' + ');
+      var e = (d.breaks || []).map(function(x){ return fmtStamp(x.to).time; }).join(' + ');
+      rows.push([d.date, d.status, fmtStamp(d.in).time, b, e, fmtStamp(d.out).time,
+                 hm(d.totalMin), hm(d.breakMin), hm(d.workMin), d.punches]);
+    });
+  }
+  var esc2 = function(v){ return '"' + String(v == null ? '' : v).replace(/"/g,'""') + '"'; };
+  var csv = rows.map(function(r){ return r.map(esc2).join(','); }).join(String.fromCharCode(13,10));
+  var a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = name + '.csv';
+  a.click();
+}
+
+function spark(series){
+  var max = Math.max.apply(null, series.map(function(p){ return p.count; }).concat([1]));
+  var w = 13, gap = 4, h = 44;
+  return '<svg width="' + (series.length*(w+gap)) + '" height="' + (h+18) + '">'
+    + series.map(function(p, i){
+        var bh = Math.max(2, Math.round(p.count / max * h));
+        return '<rect x="' + (i*(w+gap)) + '" y="' + (h-bh) + '" width="' + w + '" height="' + bh
+          + '" rx="2" fill="' + (p.count ? '#2f81f7' : '#30363d') + '"><title>' + p.date + ': '
+          + p.count + ' punches</title></rect>'
+          + '<text x="' + (i*(w+gap)+w/2) + '" y="' + (h+13) + '" font-size="9" fill="#8b949e"'
+          + ' text-anchor="middle">' + p.date.slice(8) + '</text>';
+      }).join('')
+    + '</svg>';
+}
+
+function loadStats(){
+  fetch('/api/stats').then(function(r){ return r.json(); }).then(function(t){
+    var memPct = Math.round((1 - t.host.freeMem/t.host.totalMem) * 100);
+    q('statBox').innerHTML = '<div class="grid">'
+      + kpi('Stored data', bytes(t.store.total))
+      + kpi('Punches', t.counts.logs)
+      + kpi('Employees', t.counts.users)
+      + kpi('Devices online', t.counts.online + ' / ' + t.counts.devices,
+            t.counts.online ? 'var(--ok)' : 'var(--bad)')
+      + kpi('Server uptime', hm(Math.round(t.proc.uptime/60)))
+      + kpi('Process memory', bytes(t.proc.rss))
+      + kpi('Host memory', memPct + '%', memPct > 85 ? 'var(--warn)' : '')
+      + kpi('Load (1m)', t.host.load[0], t.host.load[0] > t.host.cpus ? 'var(--warn)' : '')
+      + '</div>'
+      + '<div class="hint" style="margin-bottom:6px">Punches per day (last 14 days)</div>'
+      + '<div style="overflow-x:auto">' + spark(t.series) + '</div>'
+      + '<div class="hint" style="margin-top:12px">Files in ./data &mdash; '
+      + t.store.files.map(function(f){ return esc(f.name) + ' <b>' + bytes(f.bytes) + '</b>'; }).join(' &middot; ')
+      + '</div>'
+      + '<div class="hint" style="margin-top:6px">Node ' + esc(t.proc.node) + ' &middot; '
+      + esc(t.host.platform) + ' &middot; ' + t.host.cpus + ' CPU &middot; port ' + t.proc.port + '</div>';
+  });
+}
+
+function loadIps(){
+  fetch('/api/settings').then(function(r){ return r.json(); }).then(function(c){
+    q('ipList').value = (c.allowIps || []).join(', ');
+    q('myIp').textContent = c.yourIp || '?';
+    q('doorPin').placeholder = c.doorPinSet ? 'code set - type a new one to change' : 'door code (blank = no code)';
+    q('doorPinMsg').innerHTML = c.doorPinSet
+      ? '<span style="color:var(--ok)">/opendoor asks for a code.</span>'
+      : '<span style="color:var(--warn)">/opendoor is open to anyone on this network.</span>';
+    q('setFace').checked = c.faceOnly !== false;
+    q('setDwell').value = Math.round((c.dwellSec || 180) / 60);
+    if (FACE !== (c.faceOnly === false ? 0 : 1)) setFace(c.faceOnly === false ? 0 : 1);
+    var base = location.origin;
+    q('hrUrls').innerHTML = [
+      base + '/api/hr/attendance?from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/attendance?pin=2&from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/punches?from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/users'
+    ].map(esc).join('<br>');
+    q('ipMsg').innerHTML = (c.allowIps || []).length
+      ? '<span style="color:var(--ok)">Allow-list active for ' + c.allowIps.length + ' address(es).</span>'
+      : '<span style="color:var(--bad)">Empty list &mdash; the HR API is blocked for everyone.</span>';
+  });
+}
+function useMyIp(){
+  var cur = q('ipList').value.trim();
+  var mine = q('myIp').textContent;
+  q('ipList').value = cur ? cur + ', ' + mine : mine;
+}
+function saveDoorPin(){
+  fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ doorPin: q('doorPin').value.trim() }) })
+    .then(function(){ q('doorPin').value = ''; loadIps(); });
+}
+function saveRules(){
+  var mins = Number(q('setDwell').value);
+  if (!(mins >= 0 && mins <= 60)) mins = 3;
+  fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ faceOnly: q('setFace').checked, dwellSec: Math.round(mins * 60) }) })
+    .then(function(r){ return r.json(); })
+    .then(function(c){
+      q('ruleMsg').innerHTML = '<span style="color:var(--ok)">Saved.</span> Attendance now counts '
+        + (c.faceOnly ? '<b>face punches only</b>' : 'every verification mode')
+        + ', folding taps within ' + Math.round(c.dwellSec / 60) + ' min into one movement.';
+      loadAtt();
+    });
+}
+function saveIps(){
+  var list = q('ipList').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+  fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ allowIps: list }) }).then(loadIps);
+}
+
+function exportCsv(){ window.location = '/api/export.csv?' + params().toString(); }
+
+boot();
+setInterval(refresh, 3000);
+</script>
+</body></html>`;
+
+/* ------------------------------------------------- door kiosk page (/opendoor) */
+
+const DOOR_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Open door</title>
+<style>
+:root{--bg:#0b0f14;--fg:#e6edf3;--dim:#8b949e;--line:#222a35;
+--accent:#3b82f6;--ok:#22c55e;--bad:#ef4444;}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;min-height:100vh;background:
+radial-gradient(1100px 620px at 50% -12%,#16202e 0%,var(--bg) 62%);
+color:var(--fg);font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
+display:flex;flex-direction:column;align-items:center;justify-content:center;
+padding:26px;gap:26px;overflow:hidden}
+.top{position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:10px;
+padding:14px 18px;font-size:12.5px;color:var(--dim)}
+.dot{width:8px;height:8px;border-radius:8px;background:var(--dim);flex:0 0 auto}
+.dot.on{background:var(--ok);box-shadow:0 0 0 4px rgba(34,197,94,.16)}
+.dot.off{background:var(--bad);box-shadow:0 0 0 4px rgba(239,68,68,.14)}
+h1{font-size:19px;font-weight:600;margin:0;letter-spacing:.2px;text-align:center}
+.sub{color:var(--dim);font-size:13.5px;text-align:center;margin-top:6px}
+
+.stage{position:relative;width:264px;height:264px;display:grid;place-items:center}
+/* the ring breathes while idle so the button reads as live, not a screenshot */
+.halo{position:absolute;inset:16px;border-radius:50%;border:1px solid rgba(59,130,246,.35);
+animation:breathe 2.6s ease-out infinite}
+.halo.b{animation-delay:1.3s}
+@keyframes breathe{0%{transform:scale(.9);opacity:.55}100%{transform:scale(1.28);opacity:0}}
+
+#btn{position:relative;width:210px;height:210px;border-radius:50%;border:0;cursor:pointer;
+color:#fff;font:600 19px/1.2 inherit;letter-spacing:.4px;
+background:linear-gradient(160deg,#4c8dff,#2563eb 62%,#1d4ed8);
+box-shadow:0 20px 48px rgba(37,99,235,.42),inset 0 1px 0 rgba(255,255,255,.28);
+transition:transform .14s cubic-bezier(.2,.7,.3,1),box-shadow .2s,background .3s;
+display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;padding:0}
+#btn:active{transform:scale(.955)}
+#btn:disabled{cursor:default}
+#btn .ico{width:46px;height:46px;display:block}
+#btn .ico path,#btn .ico circle,#btn .ico rect{stroke:#fff;stroke-width:2;fill:none;
+stroke-linecap:round;stroke-linejoin:round}
+
+/* one ripple per press, removed as soon as it finishes */
+.ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,.32);
+transform:scale(0);animation:ripple .62s ease-out forwards;pointer-events:none}
+@keyframes ripple{to{transform:scale(2.6);opacity:0}}
+
+/* the spinner only exists while we are waiting on the terminal */
+.spin{position:absolute;inset:-9px;border-radius:50%;border:3px solid transparent;
+border-top-color:rgba(255,255,255,.92);border-right-color:rgba(255,255,255,.35);
+animation:spin .85s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+body.busy #btn{background:linear-gradient(160deg,#3f7ae0,#1e51c9)}
+body.ok #btn{background:linear-gradient(160deg,#34d27a,#16a34a 62%,#15803d);
+box-shadow:0 20px 48px rgba(34,197,94,.42),inset 0 1px 0 rgba(255,255,255,.28)}
+body.bad #btn{background:linear-gradient(160deg,#f87171,#dc2626 62%,#b91c1c);
+box-shadow:0 20px 48px rgba(239,68,68,.4),inset 0 1px 0 rgba(255,255,255,.28)}
+body.ok .halo,body.bad .halo,body.busy .halo{display:none}
+/* the tick draws itself in on success */
+.tick{stroke-dasharray:34;stroke-dashoffset:34;animation:draw .42s .06s ease-out forwards}
+@keyframes draw{to{stroke-dashoffset:0}}
+
+#msg{min-height:46px;max-width:420px;text-align:center;font-size:14px;color:var(--dim)}
+#msg b{color:var(--fg)}
+.pinbox{display:flex;gap:8px;justify-content:center}
+.pinbox input{background:#0d131b;border:1px solid var(--line);color:var(--fg);border-radius:9px;
+padding:11px 14px;font-size:17px;width:150px;text-align:center;letter-spacing:5px;font-family:inherit}
+.foot{position:fixed;bottom:0;left:0;right:0;text-align:center;padding:13px;
+font-size:12px;color:#5b6572}
+.foot a{color:#5b6572}
+@media(max-height:560px){.stage{width:200px;height:200px}#btn{width:162px;height:162px;font-size:17px}}
+</style></head><body>
+<div class="top"><span class="dot" id="dot"></span><span id="gates">checking terminals&hellip;</span></div>
+
+<div><h1 id="head">Open the door</h1><div class="sub" id="sub">Press and hold nothing &mdash; one tap is enough.</div></div>
+
+<div class="stage">
+  <div class="halo"></div><div class="halo b"></div>
+  <button id="btn" onclick="press(event)">
+    <svg class="ico" id="ico" viewBox="0 0 32 32"><path id="icoPath"
+      d="M20 5H9a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h11"/><path d="M20 16h6m-3-3 3 3-3 3"/></svg>
+    <span id="label">Open</span>
+  </button>
+</div>
+
+<div id="msg"></div>
+<div class="pinbox" id="pinbox" style="display:none">
+  <input id="pin" type="password" inputmode="numeric" placeholder="code" autocomplete="off">
+</div>
+
+<div class="foot"><a href="/">Attendance dashboard</a></div>
+
+<script>
+var q = function(id){ return document.getElementById(id); };
+var esc = function(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); };
+var busy = false, resetTimer = null;
+
+function setState(cls, head, msg){
+  document.body.className = cls || '';
+  q('head').textContent = head;
+  q('msg').innerHTML = msg || '';
+}
+function idle(){
+  busy = false;
+  q('btn').disabled = false;
+  q('label').textContent = 'Open';
+  var s = q('spin'); if (s) s.remove();
+  q('ico').innerHTML = '<path d="M20 5H9a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h11"/>'
+    + '<path d="M20 16h6m-3-3 3 3-3 3"/>';
+  setState('', 'Open the door', '');
+}
+function finish(cls, head, msg){
+  busy = false;
+  q('btn').disabled = false;
+  var s = q('spin'); if (s) s.remove();
+  if (cls === 'ok'){
+    q('label').textContent = 'Open';
+    q('ico').innerHTML = '<path class="tick" d="M8 16.5 13.5 22 24 11"/>';
+  } else {
+    q('label').textContent = 'Retry';
+    q('ico').innerHTML = '<path d="M16 9v9"/><circle cx="16" cy="23" r="1.2" fill="#fff"/>';
+  }
+  setState(cls, head, msg);
+  clearTimeout(resetTimer);
+  resetTimer = setTimeout(idle, cls === 'ok' ? 3500 : 7000);
+}
+
+function press(ev){
+  var b = q('btn');
+  var r = b.getBoundingClientRect(), d = Math.max(r.width, r.height);
+  var el = document.createElement('span');
+  el.className = 'ripple';
+  el.style.width = el.style.height = d + 'px';
+  el.style.left = ((ev.clientX || r.left + r.width/2) - r.left - d/2) + 'px';
+  el.style.top = ((ev.clientY || r.top + r.height/2) - r.top - d/2) + 'px';
+  b.appendChild(el);
+  setTimeout(function(){ el.remove(); }, 640);
+  if (busy) return;
+  fire();
+}
+
+function fire(){
+  busy = true;
+  clearTimeout(resetTimer);
+  q('btn').disabled = true;
+  q('label').textContent = 'Opening';
+  if (!q('spin')){
+    var s = document.createElement('span'); s.className = 'spin'; s.id = 'spin';
+    q('btn').appendChild(s);
+  }
+  setState('busy', 'Opening&hellip;', 'Waiting for the terminal to answer.');
+  fetch('/api/opendoor', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ pin: q('pin').value || '' })})
+    .then(function(r){ return r.json().then(function(j){ j._code = r.status; return j; }); })
+    .then(function(j){
+      if (j._code === 401){
+        q('pinbox').style.display = 'flex';
+        q('pin').focus();
+        return finish('bad', 'Code needed', 'Enter the door code below, then press again.');
+      }
+      if (!j.ok) return finish('bad', 'Could not open', esc(j.error || 'The server refused.'));
+      poll(j.queued.map(function(c){ return c.id; }), Date.now() + 30000);
+    })
+    .catch(function(){ finish('bad', 'No connection', 'The attendance server did not answer.'); });
+}
+
+function poll(ids, deadline){
+  fetch('/api/cmd/status?ids=' + ids.join(','))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      var all = j.items.concat(j.followups);
+      if (all.some(function(c){ return c.ok === true; }))
+        return finish('ok', 'Unlocked', 'The terminal accepted it.');
+      // a rejected wording queues the next one, so keep waiting while any is open
+      if (all.length && !all.some(function(c){ return c.ok === null; })){
+        var last = all[all.length - 1];
+        return finish('bad', 'Terminal refused',
+          'It answered <b>' + esc(String(last && last.result)) + '</b> to every unlock command. '
+          + 'The door relay may not be wired to this terminal.');
+      }
+      if (Date.now() > deadline)
+        return finish('bad', 'No answer', 'The terminal did not reply within 30 seconds.');
+      setTimeout(function(){ poll(ids, deadline); }, 900);
+    })
+    .catch(function(){ finish('bad', 'No connection', 'Lost the attendance server.'); });
+}
+
+function gates(){
+  fetch('/api/door').then(function(r){ return r.json(); }).then(function(j){
+    q('dot').className = 'dot ' + (j.online ? 'on' : 'off');
+    q('gates').textContent = j.online
+      ? j.online + ' of ' + j.devices + ' terminal(s) online'
+      : (j.devices ? 'no terminal is online' : 'no terminal has connected yet');
+    if (j.needsPin) q('pinbox').style.display = 'flex';
+    q('sub').textContent = j.online ? 'One tap unlocks every terminal that is online.'
+                                    : 'The door cannot open until a terminal reconnects.';
+  }).catch(function(){});
+}
+gates();
+setInterval(gates, 10000);
+document.addEventListener('keydown', function(e){
+  if ((e.key === 'Enter' || e.key === ' ') && !busy && document.activeElement !== q('pin')){
+    e.preventDefault(); fire();
+  }
+});
 </script>
 </body></html>`;
 
@@ -1702,27 +2555,15 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { return textOut(res, 'Bad Request', 400); }
 
   try {
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      });
-      return res.end();
-    }
     if (route.startsWith('/iclock')) return await handleDevice(req, res, route, query);
-    // /health sits outside /api/, so it needs naming here or it 404s.
-    if (route.startsWith('/api/') || route === '/health') {
-      return await handleApi(req, res, route, query);
-    }
+    if (route === '/health' || route.startsWith('/api/')) return await handleApi(req, res, route, query);
     if (route === '/' || route === '/index.html') {
-      const b = Buffer.from(HTML, 'utf8');
-      res.writeHead(200, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Content-Length': b.length,
-        'Cache-Control': 'no-cache',
-      });
-      return res.end(b);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(HTML);
+    }
+    if (route === '/opendoor' || route === '/opendoor.html') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(DOOR_HTML);
     }
     if (route === '/favicon.ico') { res.writeHead(204); return res.end(); }
     return textOut(res, 'Not found', 404);
@@ -1730,17 +2571,6 @@ const server = http.createServer(async (req, res) => {
     trace('err', '', route + ' -> ' + e.message);
     return textOut(res, 'Server error', 500);
   }
-});
-
-// Terminals keep sockets open and sometimes vanish mid-request. Without these
-// the default 5s keep-alive raced the device's own reuse of the connection,
-// which shows up as an occasional failed poll.
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 70000;
-server.requestTimeout = 120000;
-server.on('clientError', (err, socket) => {
-  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-  trace('err', '', 'bad client request: ' + err.message);
 });
 
 server.on('error', (err) => {
@@ -1765,30 +2595,8 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-// One malformed push should never take the whole server down and leave the
-// terminal with nothing to talk to.
-process.on('uncaughtException', (e) => {
-  trace('err', '', 'uncaught: ' + (e && e.stack ? e.stack.split('\n')[0] : e));
-  console.error(e);
-});
-process.on('unhandledRejection', (e) => {
-  trace('err', '', 'unhandled rejection: ' + (e && e.message ? e.message : e));
-});
-
-let closing = false;
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    if (closing) process.exit(0);
-    closing = true;
-    console.log('\n  saving state and shutting down...');
-    dirty = true;
-    flushState();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
-  });
-}
-
 loadState();
+backfillDevTime();
 server.listen(PORT, '0.0.0.0', () => {
   const ips = lanIPs();
   console.log('');
@@ -1796,6 +2604,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('  ------------------------------------------------------------');
   console.log('  Dashboard    http://localhost:' + PORT);
   ips.forEach((ip) => console.log('               http://' + ip + ':' + PORT));
+  console.log('  Door button  http://' + (ips[0] || 'localhost') + ':' + PORT + '/opendoor');
   console.log('');
   console.log('  On the device: Menu > COMM > Cloud Server Setting (ADMS)');
   console.log('     Server Address : ' + (ips[0] || '<this PC IP>'));
@@ -1805,9 +2614,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('  Loaded ' + state.logs.length + ' punches, '
     + Object.keys(state.users).length + ' users, '
     + Object.keys(state.devices).length + ' device(s) from ./data');
-  if (startupWarnings.length) {
-    console.log('');
-    startupWarnings.forEach((w) => console.log('  !! ' + w));
-  }
   console.log('');
 });
