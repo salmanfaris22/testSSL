@@ -43,6 +43,17 @@
     "sn": "ZHM2255300866",
     "updated": 1788413541197
   },
+  "5": {
+    "pin": "5",
+    "name": "MUSTHAFA",
+    "card": "",
+    "privilege": "14",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 2
+    }
+  },
   "6": {
     "pin": "6",
     "name": "Shyam",
@@ -102,5 +113,444 @@
       "BIODATA": 1,
       "BIOPHOTO": 1
     }
+  },
+  "11": {
+    "pin": "11",
+    "name": "FARIS",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1
+    }
+  },
+  "12": {
+    "pin": "12",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    },
+    "name": "Sarjina",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "100": {
+    "pin": "100",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 2
+    },
+    "name": "ATHULYA AJITH",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "101": {
+    "pin": "101",
+    "name": "ATHIRAJOSE",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "102": {
+    "pin": "102",
+    "name": "ARUNIMA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    }
+  },
+  "104": {
+    "pin": "104",
+    "name": "FARSHAD",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1,
+      "USERPIC": 1
+    }
+  },
+  "105": {
+    "pin": "105",
+    "name": "SAMAD",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1,
+      "USERPIC": 1
+    }
+  },
+  "107": {
+    "pin": "107",
+    "name": "MUFEEDA PC",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    }
+  },
+  "108": {
+    "pin": "108",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    },
+    "name": "NIRMAL",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "109": {
+    "pin": "109",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    },
+    "name": "SHUHAIB",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "110": {
+    "pin": "110",
+    "name": "DEVU",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    }
+  },
+  "111": {
+    "pin": "111",
+    "name": "AHADHIN",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1,
+      "USERPIC": 1
+    }
+  },
+  "112": {
+    "pin": "112",
+    "name": "JILSHIDA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788586265511
+  },
+  "501": {
+    "pin": "501",
+    "name": "FARIZ",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    }
+  },
+  "502": {
+    "pin": "502",
+    "name": "SOORYA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    }
+  },
+  "503": {
+    "pin": "503",
+    "name": "SHANEEB",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1,
+      "USERPIC": 1
+    }
+  },
+  "504": {
+    "pin": "504",
+    "name": "IRFAQUE",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "505": {
+    "pin": "505",
+    "name": "RAZAL",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "506": {
+    "pin": "506",
+    "name": "PRANAV",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "508": {
+    "pin": "508",
+    "name": "SAHAL",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "510": {
+    "pin": "510",
+    "name": "YAHID",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "512": {
+    "pin": "512",
+    "name": "SHIHAN",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788587499497
+  },
+  "517": {
+    "pin": "517",
+    "name": "ABHINAND",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "518": {
+    "pin": "518",
+    "name": "RIFA K",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788587288640
+  },
+  "1000": {
+    "pin": "1000",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 2
+    },
+    "name": "FASNA MALI",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "1001": {
+    "pin": "1001",
+    "name": "HUSNA NIHALA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "1002": {
+    "pin": "1002",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 1
+    },
+    "name": "RAEES ABDUL",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "1003": {
+    "pin": "1003",
+    "name": "AMNA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "1004": {
+    "pin": "1004",
+    "name": "NASITHA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "1005": {
+    "pin": "1005",
+    "name": "JUBINAS",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788586653846
+  },
+  "1008": {
+    "pin": "1008",
+    "name": "LAKSHMI",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "1009": {
+    "pin": "1009",
+    "name": "NAJIYA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788587646420
+  },
+  "1011": {
+    "pin": "1011",
+    "name": "SHIBINA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940,
+    "bio": {
+      "BIODATA": 1,
+      "BIOPHOTO": 1
+    }
+  },
+  "1018": {
+    "pin": "1018",
+    "name": "FARVIN",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788586933238
+  },
+  "1019": {
+    "pin": "1019",
+    "name": "JAMSHEENA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788587895997
+  },
+  "1021": {
+    "pin": "1021",
+    "bio": {
+      "BIOPHOTO": 1,
+      "BIODATA": 2
+    },
+    "name": "NIDHA SHEKHA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788581355940
+  },
+  "1022": {
+    "pin": "1022",
+    "name": "JASMIN",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788587106862
+  },
+  "1032": {
+    "pin": "1032",
+    "name": "RIYAS",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788585911799
+  },
+  "1035": {
+    "pin": "1035",
+    "name": "RAIMA",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788586436035
+  },
+  "1036": {
+    "pin": "1036",
+    "name": "ANFAS",
+    "card": "",
+    "privilege": "0",
+    "sn": "ZHM2255300866",
+    "updated": 1788586034609
   }
 }
