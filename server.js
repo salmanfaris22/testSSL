@@ -118,14 +118,60 @@ function backfillDevTime() {
     const t = shiftStamp(r.devTime, off);
     if (t !== r.time) { r.time = t; changed++; }
   }
-  if (!filled) return;
-  rewriteAttlog();
-  trace('info', '-', 'recovered device stamps for ' + filled + ' old punch(es), '
+  if (filled) trace('info', '-', 'recovered device stamps for ' + filled + ' old punch(es), '
     + changed + ' corrected to Indian time');
+  return filled;
+}
+
+// History written before PINs were normalised still carries the padded
+// spelling, which reads as a second, nameless employee. Fold it onto the
+// canonical PIN, and merge the two user records if both somehow exist.
+function normalisePins() {
+  let punches = 0;
+  for (const r of state.logs) {
+    const pin = normPin(r.pin);
+    if (pin !== r.pin) { r.pin = pin; punches++; }
+  }
+  let users = 0;
+  for (const key of Object.keys(state.users)) {
+    const pin = normPin(key);
+    if (pin === key) continue;
+    const from = state.users[key];
+    delete state.users[key];
+    users++;
+    const to = state.users[pin];
+    if (!to) { from.pin = pin; state.users[pin] = from; continue; }
+    // whichever record actually carries the detail wins, field by field
+    to.name = to.name || from.name || '';
+    to.card = to.card || from.card || '';
+    to.privilege = to.privilege || from.privilege;
+    to.bio = to.bio || from.bio;
+  }
+  if (users) saveSoon();
+  if (punches || users) trace('info', '-', 'folded ' + punches + ' punch(es) and '
+    + users + ' user record(s) onto their unpadded PIN');
+  return punches;
+}
+
+// Both migrations rewrite the same file, so they run together and it is
+// written once.
+function migrate() {
+  const touched = normalisePins() + backfillDevTime();
+  if (touched) rewriteAttlog();
 }
 
 function punchKey(r) {
   return r.sn + '|' + r.pin + '|' + r.time + '|' + r.status;
+}
+
+// The terminals are inconsistent about leading zeros: the same enrolment
+// arrives as PIN 2 in a user record and 002 in a punch. Left alone that is two
+// employees - one of them nameless - splitting a person's day between them.
+// Strip the padding so both spellings land on the same person. Non-numeric
+// PINs are left exactly as the device sent them.
+function normPin(p) {
+  const v = String(p == null ? '' : p).trim();
+  return /^\d+$/.test(v) ? v.replace(/^0+(?=\d)/, '') : v;
 }
 
 function shiftStamp(t, mins) {
@@ -332,7 +378,8 @@ const STATUS = {
   4: 'OT-In', 5: 'OT-Out', 255: 'Punch',
 };
 
-function addPunch(sn, pin, devTime, status, verify, workcode, extra, offset) {
+function addPunch(sn, rawPin, devTime, status, verify, workcode, extra, offset) {
+  const pin = normPin(rawPin);
   const time = shiftStamp(devTime, offset);
   const key = punchKey({ sn, pin: String(pin), time, status: Number(status) || 0 });
   if (seen.has(key)) return false;
@@ -393,7 +440,8 @@ function parseOperlog(sn, body) {
     if (/^USER\s/i.test(line)) {
       const o = kv(line.replace(/^USER\s+/i, ''));
       if (!o.PIN) continue;
-      const u = state.users[o.PIN] || (state.users[o.PIN] = { pin: o.PIN });
+      const pin = normPin(o.PIN);
+      const u = state.users[pin] || (state.users[pin] = { pin });
       u.name = o.Name || u.name || '';
       u.card = o.Card || u.card || '';
       u.privilege = o.Pri || u.privilege || '0';
@@ -402,7 +450,7 @@ function parseOperlog(sn, body) {
       users++;
     } else if (/^(FP|FACE|BIODATA|BIOPHOTO|USERPIC)\s/i.test(line)) {
       const o = kv(line.replace(/^\S+\s+/, ''));
-      const pin = o.PIN || o.Pin;
+      const pin = normPin(o.PIN || o.Pin);
       if (pin) {
         const u = state.users[pin] || (state.users[pin] = { pin });
         const t = line.split(/\s/)[0].toUpperCase();
@@ -1153,13 +1201,14 @@ async function handleApi(req, res, route, q) {
       return jsonOut(res, { ok: false, error: 'unknown command' }, 400);
     }
     if (p.kind === 'adduser' && p.pin) {
-      const u = state.users[p.pin] || (state.users[p.pin] = { pin: String(p.pin) });
+      const pin = normPin(p.pin);
+      const u = state.users[pin] || (state.users[pin] = { pin });
       u.name = p.name || u.name || '';
       u.card = p.card || u.card || '';
       u.privilege = String(p.pri || 0);
       saveSoon();
     }
-    if (p.kind === 'deluser' && p.pin) { delete state.users[p.pin]; saveSoon(); }
+    if (p.kind === 'deluser' && p.pin) { delete state.users[normPin(p.pin)]; saveSoon(); }
     const queued = targets.map((sn) => enqueue(sn,
       buildCommand(p.kind, Object.assign({}, p, { sn })), { kind: p.kind }));
     return jsonOut(res, {
@@ -1550,6 +1599,7 @@ h1{font-size:15px}
         <div class="body">
           <div class="btns">
             <button class="p" onclick="openDoor()">Open door</button>
+            <button class="p" onclick="syncData()">Sync data</button>
             <button onclick="cmd('synctime')">Sync clock</button>
             <button onclick="cmd('queryuser')">Pull users</button>
             <button onclick="cmd('queryatt',{days:7})">Pull 7 days</button>
@@ -1558,6 +1608,7 @@ h1{font-size:15px}
             <button onclick="cmd('check')">Full re-sync</button>
             <button onclick="cmd('reboot')">Reboot</button>
           </div>
+          <div class="note" id="cmdMsg" style="margin-top:8px"></div>
         </div>
       </div>
 
@@ -2068,6 +2119,30 @@ function doorProbe(){
         + 'a few seconds of each terminal polling.');
       setTimeout(loadDoor, 1200);
     });
+}
+
+// Names go missing when someone is enrolled on the terminal but never synced
+// here, and punches go missing when the terminal was offline. One press asks
+// for both: who is enrolled, then the last 30 days of punches. Already-stored
+// punches are ignored on arrival, so this is safe to press at any time.
+function syncData(){
+  var box = q('cmdMsg');
+  if (box) box.textContent = 'asking the terminals for users and the last 30 days...';
+  Promise.all([post('queryuser', {}), post('queryatt', {days: 30})])
+    .then(function(rs){
+      var bad = rs.filter(function(r){ return !r.ok; });
+      if (box) box.textContent = bad.length
+        ? (bad[0].error || 'the terminals did not accept the request')
+        : 'requested - the terminals answer over the next minute or two.';
+      refresh();
+    });
+}
+
+function post(kind, extra){
+  return fetch('/api/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(Object.assign({kind: kind}, extra || {}))})
+    .then(function(r){ return r.json(); })
+    .catch(function(){ return {ok:false, error:'server unreachable'}; });
 }
 
 function cmd(kind, extra, confirmMsg){
@@ -2726,7 +2801,7 @@ server.on('error', (err) => {
 });
 
 loadState();
-backfillDevTime();
+migrate();
 server.listen(PORT, '0.0.0.0', () => {
   const ips = lanIPs();
   console.log('');
