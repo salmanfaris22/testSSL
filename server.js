@@ -1144,6 +1144,19 @@ function parseUserList(text) {
   return { rows, over };
 }
 
+// Which rows a push actually sends. Re-sending a record the terminal already
+// has is harmless - DATA UPDATE USERINFO is an upsert - so "unchanged" is a
+// real choice, not a mistake: it is how a terminal that was wiped gets its
+// names back from records this server still holds.
+const PICK = {
+  all: ['new', 'update', 'same'],
+  new: ['new'],
+  update: ['update'],
+  same: ['same'],
+};
+
+const PICK_WORD = { all: 'usable', new: 'new', update: 'changed', same: 'unchanged' };
+
 const PRI_LABEL = { 0: 'User', 2: 'Enroller', 6: 'Manager', 14: 'Super admin' };
 
 // What the paste would do to the records we already hold. Runs on the same
@@ -1408,17 +1421,18 @@ async function handleApi(req, res, route, q) {
     const pri = String(Number(p.pri) || 0);
     const parsed = parseUserList(p.text);
     const counts = gradeImport(parsed.rows, pri);
-    const wanted = parsed.rows.filter((r) => r.status === 'new' || r.status === 'update'
-      || (r.status === 'same' && !p.skipUnchanged));
+    const pick = PICK[p.pick] ? p.pick : 'all';
+    const wanted = parsed.rows.filter((r) => PICK[pick].includes(r.status));
     counts.push = wanted.length;
+    counts.pick = pick;
     const preview = { ok: true, dryRun: true, counts, rows: parsed.rows, over: parsed.over };
     if (p.dryRun) return jsonOut(res, preview);
 
     if (!wanted.length) {
       return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
-        error: counts.error || counts.lines === 0
+        error: counts.lines === 0 || (counts.error && !counts.new && !counts.update && !counts.same)
           ? 'nothing to push - no usable line in the paste'
-          : 'nothing to push - every record already matches' }), 400);
+          : 'nothing to push - no line in this paste is ' + PICK_WORD[pick] }), 400);
     }
     const all = Object.keys(state.devices);
     const online = all.filter((sn) => state.devices[sn].online);
@@ -1596,6 +1610,8 @@ color:var(--dim);white-space:nowrap}
 .st.update{background:rgba(59,130,246,.16);color:#93c5fd;border-color:rgba(59,130,246,.4)}
 .st.dupe,.st.header{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
 .st.error{background:rgba(239,68,68,.12);color:#f87171;border-color:rgba(239,68,68,.3)}
+/* a row the current pick would not send - still listed, visibly not going */
+#bRows tr.skip{opacity:.38}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
 .seg button{border:0;border-radius:0;background:transparent;color:var(--dim);padding:7px 13px}
 .seg button:hover{color:#fff}
@@ -1867,16 +1883,22 @@ h1{font-size:15px}
               <option value="0">User</option><option value="2">Enroller</option>
               <option value="6">Manager</option><option value="14">Super admin</option>
             </select>
-            <label class="hint" style="display:flex;align-items:center;gap:5px">
-              <input id="bSkip" type="checkbox" style="width:auto"> only new / changed
-            </label>
+            <span class="seg" id="bPick">
+              <button class="on" onclick="setPick('all')" id="pkall">All</button>
+              <button onclick="setPick('new')" id="pknew">New</button>
+              <button onclick="setPick('update')" id="pkupdate">Changed</button>
+              <button onclick="setPick('same')" id="pksame">Unchanged</button>
+            </span>
           </span>
         </h2>
         <div class="body">
           <p class="hint" style="margin:0 0 9px">Paste the roll as it comes &mdash; one person per line,
           number first, then the name. A tab, a comma or a run of spaces all count as the column break,
           and a heading row is ignored. <b>Preview</b> shows what was understood and changes nothing;
-          <b>Push</b> then sends one record per line to every online terminal in a single go.</p>
+          <b>Push</b> then sends the records to every online terminal in a single go. The selector
+          above chooses which ones go: all of them, only the <b>new</b> names, only the ones whose
+          details <b>changed</b>, or only the <b>unchanged</b> ones &mdash; which is how a terminal
+          that was wiped gets its names back from the records this server still holds.</p>
           <textarea id="bText" rows="7" spellcheck="false"
             placeholder="No.&#9;Student Name&#10;5001&#9;HASHIM SHAHAL K&#10;5002&#9;MUHAMMED JASIM&#10;5003&#9;MUHAMMED HIZAM"></textarea>
           <div class="row" style="margin-top:9px">
@@ -2498,16 +2520,62 @@ function delUser(){
   cmd('deluser', {pin: pin});
 }
 /* ------ bulk import: paste a roll, see what it means, push it in one go */
-var BULK = null, BULK_TIMER = null;
+var BULK = null, BULK_TIMER = null, PICK = 'all';
 var BULK_LABEL = {new:'new', update:'update', same:'unchanged', dupe:'repeat',
                   header:'heading', error:'problem'};
+// mirrors the server's sets, so the button can be re-counted without asking
+var PICK_SET = {all:['new','update','same'], new:['new'], update:['update'], same:['same']};
+var PICK_WORD = {all:'', new:'new ', update:'changed ', same:'unchanged '};
 
 function bulkNote(msg){ q('bMsg').textContent = msg; }
+
+function pickCount(c){
+  if (!c) return 0;
+  return PICK_SET[PICK].reduce(function(n, k){ return n + (c[k] || 0); }, 0);
+}
+
+// The paste is graded once; which slice of it goes out is a local decision, so
+// changing the pick re-counts the button and re-shades the table on the spot.
+function setPick(p){
+  PICK = PICK_SET[p] ? p : 'all';
+  ['all','new','update','same'].forEach(function(k){
+    q('pk' + k).className = k === PICK ? 'on' : '';
+  });
+  paintRows();
+  bulkLabel();
+  if (BULK && BULK.dryRun) bulkNote(bulkReady(BULK.counts));
+}
+
+function paintRows(){
+  var set = PICK_SET[PICK], trs = q('bRows').children;
+  for (var i = 0; i < trs.length; i++){
+    trs[i].className = set.indexOf(trs[i].getAttribute('data-st')) >= 0 ? '' : 'skip';
+  }
+}
+
+function bulkLabel(){
+  var n = pickCount(BULK && BULK.counts);
+  q('bPush').disabled = !n;
+  q('bPush').textContent = n ? 'Push ' + n + ' to device' : 'Push to device';
+}
+
+function bulkReady(c){
+  return pickCount(c) ? 'ready - nothing has been sent yet'
+    : 'no line in this paste is ' + (PICK_WORD[PICK].trim() || 'usable');
+}
+
+function labelSegs(c){
+  var n = function(k){ return c ? ' ' + (c[k] || 0) : ''; };
+  q('pkall').textContent = 'All' + (c ? ' ' + ((c.new||0) + (c.update||0) + (c.same||0)) : '');
+  q('pknew').textContent = 'New' + n('new');
+  q('pkupdate').textContent = 'Changed' + n('update');
+  q('pksame').textContent = 'Unchanged' + n('same');
+}
 
 function bulkCall(dry){
   return fetch('/api/users/import', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({text: q('bText').value, pri: q('bPri').value,
-      skipUnchanged: q('bSkip').checked, dryRun: dry})})
+      pick: PICK, dryRun: dry})})
     .then(function(r){ return r.json(); })
     .catch(function(){ return {ok:false, error:'server unreachable'}; });
 }
@@ -2518,6 +2586,7 @@ function bulkClear(){
   q('bText').value = ''; q('bRows').innerHTML = ''; q('bCounts').innerHTML = '';
   q('bWrap').style.display = 'none';
   q('bPush').disabled = true; q('bPush').textContent = 'Push to device';
+  labelSegs(null);
   bulkNote('');
 }
 
@@ -2532,28 +2601,31 @@ function bulkShow(j){
   var rows = j.rows || [], c = j.counts || {};
   q('bWrap').style.display = rows.length ? 'block' : 'none';
   q('bRows').innerHTML = rows.map(function(r){
-    return '<tr><td class="mono">' + r.line + '</td><td class="mono">' + esc(r.pin) + '</td><td>'
-      + esc(r.name) + '</td><td class="mono">' + esc(r.card || '-') + '</td><td><span class="st '
-      + r.status + '">' + (BULK_LABEL[r.status] || r.status) + '</span>'
+    return '<tr data-st="' + r.status + '"><td class="mono">' + r.line + '</td><td class="mono">'
+      + esc(r.pin) + '</td><td>' + esc(r.name) + '</td><td class="mono">' + esc(r.card || '-')
+      + '</td><td><span class="st ' + r.status + '">' + (BULK_LABEL[r.status] || r.status) + '</span>'
       + (r.note ? ' <span class="hint">' + esc(r.note) + '</span>' : '') + '</td></tr>';
   }).join('');
+  labelSegs(c);
+  paintRows();
+  // the picker above already counts what will go, so this line is only for the
+  // lines that cannot go at all - otherwise the same numbers appear twice
   var chips = [];
-  ['new','update','same','dupe','error'].forEach(function(k){
+  ['header','dupe','error'].forEach(function(k){
     if (c[k]) chips.push('<span class="st ' + k + '">' + c[k] + ' ' + BULK_LABEL[k] + '</span>');
   });
   if (j.over) chips.push('<span class="st error">' + j.over + ' line(s) over the limit, dropped</span>');
-  q('bCounts').innerHTML = chips.join(' ')
-    || '<span class="hint">nothing readable in that paste</span>';
-  q('bPush').disabled = !(c.push > 0);
-  q('bPush').textContent = c.push ? 'Push ' + c.push + ' to device' : 'Push to device';
+  q('bCounts').innerHTML = chips.length
+    ? '<span class="hint">never sent:</span> ' + chips.join(' ') : '';
+  bulkLabel();
   if (j.error) return bulkNote(j.error);
-  if (j.dryRun) bulkNote(c.push ? 'ready - nothing has been sent yet' : 'nothing left to send');
+  if (j.dryRun) bulkNote(bulkReady(c));
 }
 
 function bulkPush(){
-  var n = BULK && BULK.counts ? BULK.counts.push : 0;
+  var n = pickCount(BULK && BULK.counts);
   if (!n) return;
-  if (!confirm('Push ' + n + ' user record(s) to the terminal?')) return;
+  if (!confirm('Push ' + n + ' ' + PICK_WORD[PICK] + 'user record(s) to the terminal?')) return;
   q('bPush').disabled = true;
   bulkNote('queueing ' + n + ' record(s)...');
   bulkCall(false).then(function(j){
