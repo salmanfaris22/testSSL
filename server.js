@@ -1466,6 +1466,39 @@ async function handleApi(req, res, route, q) {
         pins: want, since, next, days,
       });
     }
+    // What HR shows when a sync comes back short: a terminal that has stopped
+    // polling is holding punches nobody can see yet.
+    if (route === '/api/hr/devices') {
+      const rows = Object.values(state.devices).map((d) => ({
+        sn: d.sn, name: (d.info && d.info.DeviceName) || d.name || '',
+        online: !!d.online, role: d.role || '',
+        last_seen: d.lastSeen || 0, punches: d.pushCount || 0,
+      }));
+      return jsonOut(res, { devices: rows, online: rows.filter((d) => d.online).length });
+    }
+    // A terminal that was offline still holds its own log. This asks for it -
+    // the command is collected on the gate's next poll, so the punches land a
+    // moment later and the next events call with the same cursor picks them up.
+    if (route === '/api/hr/fetch') {
+      const all = Object.keys(state.devices);
+      const online = all.filter((sn) => state.devices[sn].online);
+      const days = Math.min(Math.max(Number(q.get('days')) || 7, 1), 90);
+      if (!online.length) {
+        return jsonOut(res, { ok: false, queued: [], devices: all.length, online: 0, days,
+          error: all.length
+            ? 'no terminal is polling this server right now - nothing can be asked of them'
+            : 'no terminal has ever connected to this server' }, 409);
+      }
+      const queued = online.map((sn) => enqueue(sn, buildCommand('queryatt', { days }),
+        { kind: 'queryatt' }));
+      trace('info', '', 'HR asked the gates for the last ' + days + ' day(s) of log');
+      return jsonOut(res, {
+        ok: true, days, devices: all.length, online: online.length,
+        queued: queued.map((c) => ({ id: c.id, sn: c.sn })),
+        note: 'Each gate uploads on its next poll. Call /api/hr/events again with your '
+          + 'last cursor in a few seconds to collect what arrives.',
+      });
+    }
     if (route === '/api/hr/attendance') {
       const face = faceOnly(q);
       // one connected person is the common call, and it keeps the shape it has
@@ -2334,7 +2367,9 @@ h1{font-size:15px}
         <code>since=&lt;ms&gt;</code> to ask for just what has arrived since the last sync &mdash;
         each answer carries the <code>next</code> cursor to send back. Punches reach this server
         long after they happen when a terminal has been offline, so the cursor is arrival time,
-        not the punch's own clock.</span>
+        not the punch's own clock. When a gate has been away, <code>/api/hr/fetch</code> asks it
+        for its own log &mdash; it uploads on its next poll, so HR calls
+        <code>/api/hr/events</code> again a moment later with the same cursor.</span>
       </div>
     </div>
   </div>
@@ -3406,7 +3441,9 @@ function loadIps(){
       base + '/api/hr/events?pin=2,5,9&since=0',
       base + '/api/hr/attendance?pin=2&from=' + day + '&to=' + end,
       base + '/api/hr/punches?pin=2,5,9&from=' + day + '&to=' + end,
-      base + '/api/hr/users'
+      base + '/api/hr/users',
+      base + '/api/hr/devices',
+      'POST ' + base + '/api/hr/fetch?days=7'
     ].map(esc).join('<br>');
     q('ipMsg').innerHTML = (c.allowIps || []).length
       ? '<span style="color:var(--ok)">Allow-list active for ' + c.allowIps.length + ' rule(s).</span>'
