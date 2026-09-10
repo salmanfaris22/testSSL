@@ -973,6 +973,128 @@ function attendance(pin, from, to, face) {
   };
 }
 
+/* ----------------------------------------------------------- HR event feed */
+
+// HR connects people one at a time - a PIN typed against an employee - so a
+// request names the PINs it wants instead of dragging the whole terminal
+// across. No pin at all still means everyone, which is what the dashboard and
+// the CSV export ask for.
+function pinList(q) {
+  const raw = q && q.get ? String(q.get('pin') || '') : '';
+  return [...new Set(raw.split(',').map((x) => normPin(x)).filter(Boolean))];
+}
+
+const STEP_TYPE = {
+  'Check in': 'CHECK_IN', 'Break start': 'BREAK_START',
+  'Break end': 'BREAK_END', 'Check out': 'CHECK_OUT',
+};
+// What the gap before a movement says about where the person was - the same
+// reading the day timeline prints between two dots. An unmatched tap gets the
+// elapsed time but no claim, because that is exactly what is not known.
+const GAP_STATE = {
+  'Break end': 'Away on break', 'Break start': 'At work', 'Check out': 'At work',
+};
+const PENDING_NOTE = 'The day ends on an arrival, so nobody has left yet.';
+
+// The dashboard prints these; HR should not have to rebuild them from parts.
+function ampmOf(t) {
+  const m = /[ T](\d{2}):(\d{2})/.exec(t || '');
+  if (!m) return '';
+  const h = Number(m[1]);
+  return (h % 12 || 12) + ':' + m[2] + ' ' + (h >= 12 ? 'PM' : 'AM');
+}
+const hmOf = (m) => (m / 60 | 0) + 'h ' + (m % 60) + 'm';
+
+// One movement, flattened: what it was, the time it counts at, the gate that
+// saw it, and every tap behind it - a folded run keeps its taps because only a
+// person can say that two of them were different movements.
+function stepRow(e, prev) {
+  const gapMin = prev
+    ? Math.max(0, Math.round((tsOf(e.time) - tsOf(prev.time)) / 60000)) : null;
+  const where = prev ? (GAP_STATE[e.label] || '') : '';
+  return {
+    step: e.label,
+    // an Extra punch counts for nothing, so it carries no event type: it is
+    // shown, never stored as attendance
+    event_type: STEP_TYPE[e.label] || '',
+    time: e.time,
+    time_label: ampmOf(e.time),
+    gate: e.sn,
+    dir: e.dir || '',
+    taps: e.taps,
+    first_time: e.from,
+    taps_label: e.taps > 1 ? e.taps + ' taps, first ' + ampmOf(e.from) : '1 tap',
+    verify: e.verify,
+    verify_label: VERIFY[e.verify] || ('mode ' + e.verify),
+    marked: !!e.mark,
+    key: e.key,
+    gap_before_minutes: gapMin,
+    gap_before_state: where,
+    gap_before_label: gapMin === null ? '' : (hmOf(gapMin) + (where ? ' ' + where : '')),
+    rows: (e.rows || []).map((t) => ({
+      time: t.t, time_label: ampmOf(t.t), gate: t.sn, key: t.k, mark: t.m || '',
+    })),
+  };
+}
+
+// One day as HR should store it: the steps in the order they happened, and the
+// taps behind each one.
+function hrDay(pin, date, face) {
+  const d = daySummary(pin, date, face);
+  if (!d.punches) return null;
+  return {
+    pin,
+    name: (state.users[pin] && state.users[pin].name) || '',
+    date: d.date,
+    status: d.status,
+    check_in: d.in || null,
+    check_out: d.out || null,
+    check_in_label: ampmOf(d.in),
+    check_out_label: d.pending ? 'Pending' : ampmOf(d.out),
+    pending: !!d.pending,
+    pending_note: d.pending ? PENDING_NOTE : '',
+    incomplete: !!d.incomplete,
+    total_minutes: d.totalMin,
+    break_minutes: d.breakMin,
+    work_minutes: d.workMin,
+    movements: d.punches,
+    taps: d.taps,
+    ignored: d.ignored,
+    breaks: d.breaks,
+    steps: d.events.map((e, i) => stepRow(e, d.events[i - 1])),
+  };
+}
+
+// A day changes when a punch lands in it, and a punch can land days after it
+// happened - a terminal that was offline dumps its whole backlog at once. So
+// "what is new" is asked of arrival time (`recv`), never of the punch's own
+// clock: a date-range question would never see that backlog at all.
+function changedSince(since) {
+  const touched = new Set();
+  let latest = 0;
+  for (const r of state.logs) {
+    const recv = Number(r.recv) || 0;
+    if (recv > latest) latest = recv;
+    if (recv > since) touched.add(normPin(r.pin) + '|' + dayOf(r.time));
+  }
+  return { touched, latest };
+}
+
+function hrEvents(pins, from, to, face, since) {
+  const { touched, latest } = changedSince(since);
+  const days = [];
+  for (const pin of pins) {
+    for (const date of dateRange(from, to)) {
+      if (since && !touched.has(pin + '|' + date)) continue;
+      const day = hrDay(pin, date, face);
+      if (day) days.push(day);
+    }
+  }
+  days.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1
+    : Number(a.pin) - Number(b.pin)));
+  return { days, next: latest };
+}
+
 // The same run of taps that the attendance model folds into one movement also
 // fills the raw log with near-identical rows. Fold them here too, keeping the
 // last tap of each run and remembering how many there were, so the log reads
@@ -1005,7 +1127,12 @@ function collapseRepeats(rows) {
   return out;
 }
 
-function filterLogs(q) {
+// `opts.pins` is the HR reading of a pin: the exact people it has connected.
+// The dashboard's own filter stays a search box, where typing 10 should still
+// turn up 10, 100 and 1023.
+// `opts.since` is the arrival cursor - see changedSince() for why arrival and
+// not the punch's own clock.
+function filterLogs(q, opts) {
   const term = (q.get('q') || '').toLowerCase();
   const fPin = (q.get('pin') || '').trim().toLowerCase();
   const fName = (q.get('name') || '').trim().toLowerCase();
@@ -1019,6 +1146,8 @@ function filterLogs(q) {
   for (const r of rows) {
     if (!r.name && state.users[r.pin]) r.name = state.users[r.pin].name || '';
   }
+  const since = Number(opts && opts.since) || 0;
+  if (since) rows = rows.filter((r) => (Number(r.recv) || 0) > since);
   if (from) rows = rows.filter((r) => r.time >= from);
   if (to) rows = rows.filter((r) => r.time <= to + ' 23:59:59');
   if (term) {
@@ -1027,7 +1156,9 @@ function filterLogs(q) {
       (r.name || '').toLowerCase().includes(term) ||
       r.sn.toLowerCase().includes(term));
   }
-  if (fPin) rows = rows.filter((r) => r.pin.toLowerCase().includes(fPin));
+  const wantPins = opts && opts.pins && opts.pins.length ? new Set(opts.pins) : null;
+  if (wantPins) rows = rows.filter((r) => wantPins.has(normPin(r.pin)));
+  else if (fPin) rows = rows.filter((r) => r.pin.toLowerCase().includes(fPin));
   if (fName) rows = rows.filter((r) => (r.name || '').toLowerCase().includes(fName));
   if (fVerify === 'face') rows = rows.filter(isFace);
   else if (fVerify) rows = rows.filter((r) => String(r.verify) === fVerify);
@@ -1044,12 +1175,83 @@ function clientIp(req) {
   return (fwd || req.socket.remoteAddress || '').replace(/^::ffff:/, '');
 }
 
+// An HR server rarely calls from one fixed address - a NAT gateway, a pool of
+// workers, a provider that reassigns on restart - so the allow-list takes four
+// forms rather than one. Exact-match-only was a trap: "49.37.0.0" looks like a
+// range and matches nothing, so the API stayed shut with a rule sitting in it.
+//   *              every caller
+//   103.119.254.234   one address
+//   49.37.*        every address under that prefix
+//   49.37.0.0/16   the same thing in CIDR
+const ipToLong = (ip) => {
+  const parts = String(ip).split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p) || Number(p) > 255) return null;
+    n = n * 256 + Number(p);
+  }
+  return n >>> 0;
+};
+
+function cidrMatch(rule, ip) {
+  const at = rule.indexOf('/');
+  const base = ipToLong(rule.slice(0, at));
+  const addr = ipToLong(ip);
+  const bits = Number(rule.slice(at + 1));
+  if (base === null || addr === null) return false;
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  if (bits === 0) return true;
+  const mask = (bits === 32 ? -1 : ~((1 << (32 - bits)) - 1)) >>> 0;
+  return (base & mask) >>> 0 === (addr & mask) >>> 0;
+}
+
+function ipMatches(rule, ip) {
+  if (rule === '*') return true;
+  if (rule === ip) return true;
+  if (!ip) return false;
+  if (rule.includes('/')) return cidrMatch(rule, ip);
+  if (!rule.includes('*')) return false;
+  const r = rule.split('.'), a = ip.split('.');
+  // "49.37.*" stands for every octet left, so it may be shorter than the address
+  if (r[r.length - 1] === '*' ? r.length > a.length : r.length !== a.length) return false;
+  for (let i = 0; i < r.length; i++) {
+    if (r[i] === '*') return true;
+    if (r[i] !== a[i]) return false;
+  }
+  return true;
+}
+
+// A rule that can never match is worse than no rule: it looks like the door is
+// open when it is shut. The settings endpoint rejects these outright rather
+// than storing them.
+function badIpRule(rule) {
+  if (rule === '*') return '';
+  if (rule.includes('/')) {
+    const at = rule.indexOf('/');
+    const bits = Number(rule.slice(at + 1));
+    if (ipToLong(rule.slice(0, at)) === null) return 'not an address';
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) return 'prefix must be /0 to /32';
+    return '';
+  }
+  if (rule.includes('*')) {
+    const r = rule.split('.');
+    if (r.indexOf('*') !== r.length - 1) return 'the * must come last';
+    if (r.length < 2 || r.length > 4) return 'not an address pattern';
+    return r.slice(0, -1).every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)
+      ? '' : 'not an address pattern';
+  }
+  // a bare IPv6 address is kept as-is and matched exactly
+  if (rule.includes(':')) return '';
+  return ipToLong(rule) === null ? 'not an address' : '';
+}
+
 // HR integration is allow-list only, and denied while the list is empty.
 function ipAllowed(req) {
   const list = state.settings.allowIps || [];
   if (!list.length) return false;
   const ip = clientIp(req);
-  return list.some((a) => a === '*' || a === ip);
+  return list.some((rule) => ipMatches(rule, ip));
 }
 
 function dirSize(dir) {
@@ -1241,20 +1443,40 @@ async function handleApi(req, res, route, q) {
     const today = localDate(new Date());
     const to = q.get('to') || today;
     const from = q.get('from') || to;
+    // Which people HR asked for. Empty means everyone, so a first sync can
+    // still see the roll and connect it up.
+    const want = pinList(q);
+    const scope = want.length ? want : Object.keys(state.users);
+    const since = Number(q.get('since')) || 0;
     if (route === '/api/hr/users') {
-      return jsonOut(res, { users: Object.values(state.users) });
+      const users = Object.values(state.users)
+        .filter((u) => !want.length || want.includes(normPin(u.pin)));
+      return jsonOut(res, { users, pins: want, total: users.length });
     }
     if (route === '/api/hr/punches') {
-      return jsonOut(res, { from, to, punches: filterLogs(q) });
+      const punches = filterLogs(q, { pins: want, since });
+      const next = state.logs.reduce((m, r) => Math.max(m, Number(r.recv) || 0), 0);
+      return jsonOut(res, { from, to, pins: want, since, next, punches });
+    }
+    if (route === '/api/hr/events') {
+      const face = faceOnly(q);
+      const { days, next } = hrEvents(scope, from, to, face, since);
+      return jsonOut(res, {
+        from, to, verifiedBy: face ? 'face' : 'any',
+        pins: want, since, next, days,
+      });
     }
     if (route === '/api/hr/attendance') {
       const face = faceOnly(q);
-      const pin = q.get('pin');
-      if (pin) return jsonOut(res, attendance(pin, from, to, face));
-      const rows = Object.keys(state.users)
+      // one connected person is the common call, and it keeps the shape it has
+      // always had; a list of them answers with the roll
+      if (want.length === 1) return jsonOut(res, attendance(want[0], from, to, face));
+      const rows = scope
         .map((x) => attendance(x, from, to, face))
         .sort((a, b) => Number(a.pin) - Number(b.pin));
-      return jsonOut(res, { from, to, verifiedBy: face ? 'face' : 'any', employees: rows });
+      return jsonOut(res, {
+        from, to, verifiedBy: face ? 'face' : 'any', pins: want, employees: rows,
+      });
     }
     return jsonOut(res, { error: 'unknown endpoint' }, 404);
   }
@@ -1331,10 +1553,16 @@ async function handleApi(req, res, route, q) {
   }
   if (route === '/api/settings' && req.method === 'POST') {
     const body = JSON.parse((await readBody(req)) || '{}');
+    let ipRejected = [];
     if (body.allowIps !== undefined) {
-      state.settings.allowIps = (body.allowIps || [])
-        .map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
-      trace('info', '', 'HR allow-list set to ' + (state.settings.allowIps.join(' ') || '(empty)'));
+      const wanted = (body.allowIps || []).map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
+      ipRejected = wanted
+        .map((rule) => ({ rule, why: badIpRule(rule) }))
+        .filter((x) => x.why);
+      const bad = new Set(ipRejected.map((x) => x.rule));
+      state.settings.allowIps = wanted.filter((rule) => !bad.has(rule));
+      trace('info', '', 'HR allow-list set to ' + (state.settings.allowIps.join(' ') || '(empty)')
+        + (ipRejected.length ? ' (rejected: ' + ipRejected.map((x) => x.rule).join(' ') + ')' : ''));
     }
     if (body.faceOnly !== undefined) state.settings.faceOnly = !!body.faceOnly;
     if (body.doorPin !== undefined) {
@@ -1347,7 +1575,7 @@ async function handleApi(req, res, route, q) {
     }
     saveSoon();
     return jsonOut(res, {
-      ok: true, allowIps: state.settings.allowIps,
+      ok: true, allowIps: state.settings.allowIps, ipRejected,
       faceOnly: faceSetting(), dwellSec: dwellSec(),
       doorPinSet: !!state.settings.doorPin,
     });
@@ -2083,18 +2311,30 @@ h1{font-size:15px}
     <h2>HR API</h2>
     <div class="body">
       <div class="note" style="margin-bottom:8px">
-        Read-only API for your HR system. Only the IP addresses listed here can call it &mdash;
-        an empty list blocks everyone. Your current IP is <b id="myIp">?</b>.
+        Read-only API for your HR system. Only the addresses listed here can call it &mdash;
+        an empty list blocks everyone. Your current IP is <b id="myIp">?</b>.<br>
+        An HR server rarely calls from one fixed address, so a rule can be any of four forms:
+        <code>*</code> every caller &middot;
+        <code>103.119.254.234</code> one address &middot;
+        <code>49.37.*</code> everything under that prefix &middot;
+        <code>49.37.0.0/16</code> the same in CIDR.
+        A rule that could never match is refused rather than saved.
       </div>
       <div class="row">
-        <input id="ipList" placeholder="103.119.254.234, 49.37.0.0  (comma separated, * = any)" style="flex:1;min-width:240px">
+        <input id="ipList" placeholder="103.119.254.234, 49.37.*, 10.0.0.0/8  (comma separated)" style="flex:1;min-width:240px">
         <button class="p" onclick="saveIps()">Save allow-list</button>
         <button onclick="useMyIp()">Use my IP</button>
       </div>
       <div id="ipMsg" class="note" style="margin-top:8px"></div>
       <div class="note" style="margin-top:12px">
         <b>Endpoints</b> &mdash; share these with HR:<br>
-        <span class="mono" id="hrUrls"></span>
+        <span class="mono" id="hrUrls"></span><br>
+        <span style="display:inline-block;margin-top:8px">Add <code>pin=2,5,9</code> to any of them
+        to fetch <b>only the people HR has connected</b>, and
+        <code>since=&lt;ms&gt;</code> to ask for just what has arrived since the last sync &mdash;
+        each answer carries the <code>next</code> cursor to send back. Punches reach this server
+        long after they happen when a terminal has been offline, so the cursor is arrival time,
+        not the punch's own clock.</span>
       </div>
     </div>
   </div>
@@ -3159,15 +3399,17 @@ function loadIps(){
     q('setFace').checked = c.faceOnly !== false;
     q('setDwell').value = Math.round((c.dwellSec || 180) / 60);
     if (FACE !== (c.faceOnly === false ? 0 : 1)) setFace(c.faceOnly === false ? 0 : 1);
-    var base = location.origin;
+    var base = location.origin, day = q('aFrom').value || '2026-09-01',
+        end = q('aTo').value || '2026-09-08';
     q('hrUrls').innerHTML = [
-      base + '/api/hr/attendance?from=2026-09-01&to=2026-09-08',
-      base + '/api/hr/attendance?pin=2&from=2026-09-01&to=2026-09-08',
-      base + '/api/hr/punches?from=2026-09-01&to=2026-09-08',
+      base + '/api/hr/events?pin=2,5,9&from=' + day + '&to=' + end,
+      base + '/api/hr/events?pin=2,5,9&since=0',
+      base + '/api/hr/attendance?pin=2&from=' + day + '&to=' + end,
+      base + '/api/hr/punches?pin=2,5,9&from=' + day + '&to=' + end,
       base + '/api/hr/users'
     ].map(esc).join('<br>');
     q('ipMsg').innerHTML = (c.allowIps || []).length
-      ? '<span style="color:var(--ok)">Allow-list active for ' + c.allowIps.length + ' address(es).</span>'
+      ? '<span style="color:var(--ok)">Allow-list active for ' + c.allowIps.length + ' rule(s).</span>'
       : '<span style="color:var(--bad)">Empty list &mdash; the HR API is blocked for everyone.</span>';
   });
 }
@@ -3197,7 +3439,16 @@ function saveRules(){
 function saveIps(){
   var list = q('ipList').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean);
   fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ allowIps: list }) }).then(loadIps);
+    body: JSON.stringify({ allowIps: list }) })
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      loadIps();
+      // a refused rule has to say so out loud: silently dropping it leaves the
+      // list looking open while the door is still shut
+      var bad = j.ipRejected || [];
+      if (bad.length) toast('Not saved: ' + bad.map(function(x){
+        return x.rule + ' (' + x.why + ')'; }).join(', '), 'bad');
+    });
 }
 
 function exportCsv(){ window.location = '/api/export.csv?' + params().toString(); }
