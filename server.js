@@ -776,12 +776,43 @@ function dwellSec() {
   return Number.isFinite(n) && n >= 0 && n <= 3600 ? n : DWELL_SEC_DEFAULT;
 }
 
+// Where every movement's direction is known - both gates carry a role, or a
+// person set the punches by hand - the day reads itself in order: the first
+// arrival opens it, a departure starts a break, the next arrival ends that
+// break, and a departure with nothing after it closes the day.
+//
+// A day that ends on an arrival is simply still open. It says so, instead of
+// borrowing the last punch as a check-out it never was: someone who taps in at
+// 9, out at 12 and in again at 1 has checked in, taken a break, and not yet
+// left, so the check-out is pending - not 1 o'clock.
+function labelByDirection(evs) {
+  let inside = false, arrived = false;
+  for (const e of evs) {
+    if (e.dir === 'in') {
+      // an arrival with no departure since the last one is the same movement
+      // read again at the other reader, not a second arrival
+      e.label = inside ? 'Extra punch' : (arrived ? 'Break end' : 'Check in');
+      inside = true;
+      arrived = true;
+      continue;
+    }
+    // a departure before anyone arrived closes nothing, so it counts for nothing
+    e.label = inside ? 'Break start' : 'Extra punch';
+    inside = false;
+  }
+  // the departure the day ends on is the check-out, not a break nobody ever
+  // came back from
+  const last = evs[evs.length - 1];
+  if (last.label === 'Break start') last.label = 'Check out';
+  return evs;
+}
+
+// No gate roles, so nothing says which way anyone went: fall back to position.
 // First movement of the day is the arrival, the last is the departure, and the
 // pairs between them are breaks. An odd number in the middle leaves one tap
 // without a partner: it stays visible but is never counted, so a stray punch
 // can neither invent a break nor stretch the day.
-function labelMovements(evs) {
-  if (!evs.length) return evs;
+function labelByAlternation(evs) {
   evs[0].label = 'Check in';
   if (evs.length === 1) return evs;
   evs[evs.length - 1].label = 'Check out';
@@ -802,6 +833,14 @@ function labelMovements(evs) {
       : (i === 0 ? 'Check in' : 'Break end');
   }
   return evs;
+}
+
+// Direction is the better reading whenever it is there for every movement;
+// position is only what is left when it is not.
+function labelMovements(evs) {
+  if (!evs.length) return evs;
+  const known = evs.every((e) => e.dir === 'in' || e.dir === 'out');
+  return known ? labelByDirection(evs) : labelByAlternation(evs);
 }
 
 // One day's punches -> the ordered movements they represent.
@@ -855,22 +894,26 @@ function dayEvents(pin, date, face) {
 
 function daySummary(pin, date, face) {
   const evs = dayEvents(pin, date, face);
-  const inEv = evs[0] || null;
-  const outEv = evs.length > 1 ? evs[evs.length - 1] : null;
+  // The labels are the day, not the ends of the list: a day can now finish on
+  // an arrival, which leaves it open with no check-out to read.
+  const inEv = evs.find((e) => e.label === 'Check in') || null;
+  const outEv = evs.find((e) => e.label === 'Check out') || null;
 
   const breaks = [];
   let breakMin = 0;
-  for (let i = 1; i < evs.length - 1; i++) {
-    if (evs[i].label !== 'Break start') continue;
-    const nxt = evs[i + 1];
-    if (!nxt || nxt.label !== 'Break end') continue;
+  let away = null;
+  for (const e of evs) {
+    if (e.label === 'Break start') { away = e; continue; }
+    if (e.label !== 'Break end' || !away) continue;
     // Tapping out and straight back in lands both punches in the same minute,
     // so the rounded gap is zero and the break would vanish from the day
     // entirely. A break that really happened costs at least a minute.
-    const ms = tsOf(nxt.time) - tsOf(evs[i].time);
+    const ms = tsOf(e.time) - tsOf(away.time);
+    const from = away.time;
+    away = null;
     if (ms < 0) continue;
     const min = Math.max(1, Math.round(ms / 60000));
-    breaks.push({ from: evs[i].time, to: nxt.time, min });
+    breaks.push({ from, to: e.time, min });
     breakMin += min;
   }
 
@@ -883,8 +926,11 @@ function daySummary(pin, date, face) {
     status: evs.length ? 'Present' : (dow === 0 ? 'Weekly off' : 'Absent'),
     in: inEv ? inEv.time : '',
     out: outEv ? outEv.time : '',
-    // one lone movement means they were seen but never seen leaving
-    incomplete: evs.length === 1,
+    // seen, but never seen leaving - one lone movement, or a day that ends on
+    // an arrival. Either way there is nothing to close the hours against.
+    incomplete: evs.length > 0 && !(inEv && outEv),
+    // still inside as far as the gates know: the check-out has not happened yet
+    pending: !!inEv && !outEv,
     punches: evs.length, taps: evs.taps || 0, ignored: evs.ignored || 0,
     breakMin, totalMin, breaks,
     workMin: Math.max(0, totalMin - breakMin),
@@ -1616,6 +1662,18 @@ color:var(--dim);white-space:nowrap}
 .seg button{border:0;border-radius:0;background:transparent;color:var(--dim);padding:7px 13px}
 .seg button:hover{color:#fff}
 .seg button.on{background:var(--accent);color:#fff}
+/* the day as a table: one row per movement, in the order it happened */
+.steps{margin:2px 0 14px}
+.steps td{padding:7px 10px}
+.steps tr:hover td{background:transparent}
+.steps .sdot{display:inline-block;width:9px;height:9px;border-radius:9px;margin-right:8px;
+box-sizing:border-box;background:var(--panel);border:2px solid var(--dim);vertical-align:middle}
+.steps .sdot.a{background:var(--ok);border-color:var(--ok)}
+.steps .sdot.z{background:var(--warn);border-color:var(--warn)}
+.steps .sdot.bs{border-color:var(--warn)}
+.steps .sdot.be{border-color:var(--ok)}
+.steps tr.x{opacity:.5}
+.steps tr.pend td{color:var(--warn)}
 /* day timeline: one dot per movement, connected top to bottom */
 .tl{position:relative;padding:4px 0 4px 28px}
 .tl:before{content:'';position:absolute;left:9px;top:18px;bottom:18px;width:2px;background:var(--line)}
@@ -2796,12 +2854,15 @@ function renderAtt(a){
     var span = d.in && d.out ? '<span class="t">' + fmtStamp(d.in).time + '</span> &ndash; <span class="t">'
                  + fmtStamp(d.out).time + '</span>'
              : d.in ? '<span class="t">' + fmtStamp(d.in).time
-                 + '</span> &ndash; <span style="color:var(--warn)">seen once only</span>'
+                 + '</span> &ndash; <span style="color:var(--warn)">check-out pending</span>'
+             : d.punches ? '<span style="color:var(--warn)">no check-in</span>'
              : '<span style="color:#8b949e">Not marked</span>';
     tb += '<tr style="cursor:pointer" onclick="openDay(' + i + ')">'
        + '<td>' + esc(f.date) + '</td>'
        + '<td style="color:' + col + '">' + esc(d.status)
-       + (d.incomplete ? ' <span class="tag">no check-out</span>' : '') + '</td>'
+       + (d.incomplete
+            ? ' <span class="tag">' + (d.pending ? 'check-out pending' : 'no check-in') + '</span>'
+            : '') + '</td>'
        + '<td>' + span + '</td>'
        + '<td class="num">' + hm(d.totalMin) + '</td>'
        + '<td class="num"' + (d.breakMin ? ' style="color:var(--warn)"' : '') + '>' + hm(d.breakMin)
@@ -2816,9 +2877,11 @@ function renderAtt(a){
   q('emptyAtt').textContent = 'No days in this range.';
   q('aFoot').innerHTML = 'Counting '
     + (a.verifiedBy === 'face' ? '<b>face-verified punches only</b>' : 'every verification mode')
-    + '. A day reads first movement in, last movement out, and the pairs between them as breaks; '
-    + 'repeat taps at the same gate are folded into one movement. '
-    + 'Open a day to set a punch to In or Out by hand &mdash; a marked punch is never folded '
+    + '. Where both terminals carry a gate role, the day reads in order: first arrival is the '
+    + 'check-in, a departure starts a break, the next arrival ends it, and a departure with '
+    + 'nothing after it is the check-out &mdash; a day that ends on an arrival stays open, with '
+    + 'the check-out pending. Repeat taps at the same gate are one movement, timed at the last '
+    + 'tap. Open a day to set a punch to In or Out by hand &mdash; a marked punch is never folded '
     + 'into its neighbour, so tapping out and straight back in reads as a break of at least a minute.'
     + (t.ignored ? ' <b>' + t.ignored + '</b> card or fingerprint punch(es) in this range were not counted.' : '');
 }
@@ -2893,21 +2956,54 @@ document.addEventListener('click', function(e){
   if (sp) return splitBreak(Number(sp.dataset.day), Number(sp.dataset.ev));
 });
 
+// The day as a table, in the order it happened: what each movement was, the
+// time it counts at, which gate saw it, and how many taps it was folded from.
+// A day whose check-in or check-out never arrived says so in its own row
+// rather than leaving the reader to notice the gap.
+function dayStepsTable(d){
+  var rows = '';
+  if (d.punches && !d.in) rows += '<tr class="pend"><td><span class="sdot a"></span>Check in</td>'
+    + '<td colspan="3">Missing &mdash; the day opens on a departure, so nothing counts against it.</td></tr>';
+  for (var k = 0; k < d.events.length; k++){
+    var e = d.events[k], cls = STEP[e.label] || 'x';
+    rows += '<tr' + (cls === 'x' ? ' class="x"' : '') + '>'
+      + '<td><span class="sdot ' + cls + '"></span>' + esc(e.label) + '</td>'
+      + '<td class="t">' + esc(fmtStamp(e.time).time) + '</td>'
+      + '<td>' + (e.dir ? '<span class="pill ' + e.dir + '">' + (e.dir === 'in' ? 'In' : 'Out')
+                          + '</span> ' : '')
+      + '<span class="hint">' + esc(e.sn) + '</span></td>'
+      + '<td class="hint">'
+      + (e.taps > 1 ? e.taps + ' taps, first ' + esc(fmtStamp(e.from).time) : '1 tap')
+      + (e.mark ? ' &middot; set by hand' : '') + '</td></tr>';
+  }
+  if (d.pending) rows += '<tr class="pend"><td><span class="sdot z"></span>Check out</td>'
+    + '<td colspan="3">Pending &mdash; the day ends on an arrival, so nobody has left yet.</td></tr>';
+  return '<table class="steps"><thead><tr><th>Step</th><th>Time</th><th>Gate</th><th>Taps</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
 function openDay(i){
   var d = ATT.days[i];
+  var bsum = (d.breaks || []).reduce(function(n, b){ return n + b.min; }, 0);
   q('mTitle').textContent = (ATT.name || ('PIN ' + ATT.pin)) + '  -  ' + fmtStamp(d.date).date;
-  q('mDate').innerHTML = d.events.length
-    ? '<b style="color:var(--fg)">' + hm(d.workMin) + '</b> worked &middot; '
-      + hm(d.totalMin) + ' on site &middot; ' + hm(d.breakMin) + ' break &middot; '
-      + d.punches + ' movement' + (d.punches === 1 ? '' : 's')
+  q('mDate').innerHTML = !d.events.length ? 'Nothing recorded on this day.'
+    // an open day has no span to report, so it reports what it does know
+    : (d.pending
+        ? '<b style="color:var(--warn)">Check-out pending</b> &middot; in at '
+          + esc(fmtStamp(d.in).time) + ' &middot; ' + hm(bsum) + ' break so far'
+        : '<b style="color:var(--fg)">' + hm(d.workMin) + '</b> worked &middot; '
+          + hm(d.totalMin) + ' on site &middot; ' + hm(d.breakMin) + ' break')
+      + ' &middot; ' + d.punches + ' movement' + (d.punches === 1 ? '' : 's')
       + (d.taps > d.punches ? ' from ' + d.taps + ' taps' : '')
-      + (d.ignored ? ' &middot; ' + d.ignored + ' non-face punch(es) skipped' : '')
-    : 'Nothing recorded on this day.';
+      + (d.ignored ? ' &middot; ' + d.ignored + ' non-face punch(es) skipped' : '');
 
   if (!d.events.length){
     q('mBody').innerHTML = '<div class="empty">No face punches on this day.</div>';
   } else {
-    var html = '<div class="tl">';
+    var html = dayStepsTable(d)
+      + '<div class="hint" style="margin:0 0 2px">Every tap behind those movements &mdash; '
+      + 'set one to In or Out to change how the day reads.</div>'
+      + '<div class="tl">';
     for (var k = 0; k < d.events.length; k++){
       var e = d.events[k], prev = d.events[k-1];
       if (prev){
@@ -2931,9 +3027,15 @@ function openDay(i){
         + dirRows(e, i) + '</div>';
     }
     html += '</div>';
-    if (d.events.length === 1) html += '<div class="note" style="padding:0 0 12px">'
-      + 'Only one movement, so there is nothing to close the day against &mdash; '
-      + 'no hours are counted.</div>';
+    if (d.pending) html += '<div class="note" style="padding:0 0 12px">'
+      + (d.events.length === 1
+          ? 'Only one movement, so there is nothing to close the day against'
+          : 'The day ends on an arrival, so the check-out has not happened yet')
+      + ' &mdash; no hours are counted. If that last punch was the person leaving, set it to '
+      + '<b>Out</b> and the day closes on it.</div>';
+    else if (!d.in) html += '<div class="note" style="padding:0 0 12px">'
+      + 'No arrival on this day, so there is nothing for these punches to belong to '
+      + '&mdash; no hours are counted.</div>';
     q('mBody').innerHTML = html;
   }
   q('modal').style.display = 'block';
@@ -2959,7 +3061,10 @@ function attCsv(){
     ATT.days.forEach(function(d){
       var b = (d.breaks || []).map(function(x){ return fmtStamp(x.from).time; }).join(' + ');
       var e = (d.breaks || []).map(function(x){ return fmtStamp(x.to).time; }).join(' + ');
-      rows.push([d.date, d.status, fmtStamp(d.in).time, b, e, fmtStamp(d.out).time,
+      // an empty check-out column could be read as a missing punch, so the
+      // export says outright that the day never closed
+      rows.push([d.date, d.status, fmtStamp(d.in).time, b, e,
+                 d.pending ? 'pending' : fmtStamp(d.out).time,
                  hm(d.totalMin), hm(d.breakMin), hm(d.workMin), d.punches]);
     });
   }
