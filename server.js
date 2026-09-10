@@ -349,6 +349,14 @@ function zkTime(d) {
     + d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
 }
 
+// Name and card ride inside a tab-separated command line, so a tab or a
+// newline in either would split the record into nonsense the terminal files
+// against the wrong column. Strip them where the command is built, so every
+// path that can set a name is covered rather than just the one that pastes.
+function cmdField(v) {
+  return String(v == null ? '' : v).replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 function buildCommand(kind, p) {
   p = p || {};
   const pad = (n) => String(n).padStart(2, '0');
@@ -367,8 +375,8 @@ function buildCommand(kind, p) {
       return 'DATA QUERY ATTLOG StartTime=' + fmt(start) + '\tEndTime=' + fmt(end);
     }
     case 'adduser':
-      return 'DATA UPDATE USERINFO PIN=' + p.pin + '\tName=' + (p.name || '')
-        + '\tPri=' + (p.pri || 0) + '\tPasswd=' + (p.passwd || '') + '\tCard=' + (p.card || '')
+      return 'DATA UPDATE USERINFO PIN=' + p.pin + '\tName=' + cmdField(p.name)
+        + '\tPri=' + (p.pri || 0) + '\tPasswd=' + (p.passwd || '') + '\tCard=' + cmdField(p.card)
         + '\tGrp=1\tTZ=0000000000000000\tVerify=-1';
     case 'deluser':  return 'DATA DELETE USERINFO PIN=' + p.pin;
     case 'raw':      return String(p.cmd || '').trim();
@@ -1061,6 +1069,109 @@ function serverStats(days) {
   };
 }
 
+/* ---------------------------------------------------- bulk user import */
+
+// A class roll never arrives as a tidy CSV. It is pasted out of a spreadsheet,
+// a PDF table or a message, so whatever survived the copy is the separator: a
+// tab, a comma, or a run of spaces. Rather than make the office reformat the
+// list, take the first field as the PIN and the rest as the name, and let a
+// preview show what was understood before anything reaches a terminal.
+const NAME_MAX = 24;      // what the firmware stores; longer names get cut there
+const IMPORT_MAX = 500;   // one paste, so a mis-paste cannot flood the queue
+let importSeq = 0;        // one paste = one batch, so progress can be asked for
+
+// A heading line ("No.  Student Name") is dropped rather than reported as a
+// broken row, because it is in every paste and it is not an operator mistake.
+const HEADER_RE = /^(no|s\.?\s*no|sl|sr|pin|id|emp(loyee)?|user|roll|serial|student|name)\b/i;
+
+function splitRow(line) {
+  if (line.indexOf('\t') >= 0) return line.split('\t');
+  if (line.indexOf(',') >= 0) return line.split(',');
+  if (line.indexOf(';') >= 0) return line.split(';');
+  if (/\s{2,}/.test(line)) return line.split(/\s{2,}/);
+  // "5001 HASHIM SHAHAL K" - one space between the columns and more inside the
+  // name, so only the first gap is a column break
+  const i = line.search(/\s/);
+  return i < 0 ? [line] : [line.slice(0, i), line.slice(i + 1)];
+}
+
+function parseUserList(text) {
+  const rows = [];
+  const at = new Map();               // pin -> row index, so a repeat can void the first
+  const lines = String(text || '').split(/\r?\n/);
+  let over = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (rows.length >= IMPORT_MAX) { over++; continue; }
+    // an empty middle field ("5001,,NAME") is a spreadsheet artefact, not a column
+    const f = splitRow(line).map((x) => x.trim()).filter((x, j) => j === 0 || x !== '');
+    const row = { line: i + 1, pin: '', name: '', card: '', status: '', note: '' };
+    let name = f.slice(1).join(' ');
+    let card = '';
+    // a trailing all-digit field is a card number - but only when there is a
+    // name in front of it, so "5001  12345678" stays a (badly named) person
+    if (f.length > 2 && /^\d{4,20}$/.test(f[f.length - 1])) {
+      card = f[f.length - 1];
+      name = f.slice(1, -1).join(' ');
+    }
+    row.name = cmdField(name);
+    row.card = card;
+    if (!/^\d/.test(f[0] || '') && HEADER_RE.test(f[0] || '')) {
+      row.pin = f[0];
+      row.status = 'header';
+      row.note = 'column heading, skipped';
+      rows.push(row);
+      continue;
+    }
+    row.pin = normPin(f[0] || '');
+    if (!row.pin) { row.status = 'error'; row.note = 'no PIN on this line'; }
+    else if (!/^\d{1,9}$/.test(row.pin)) { row.status = 'error'; row.note = 'PIN must be a number'; }
+    else if (!row.name) { row.status = 'error'; row.note = 'no name on this line'; }
+    else if (row.name.length > NAME_MAX) {
+      row.note = row.name.length + ' characters - the terminal stores about ' + NAME_MAX;
+    }
+    if (row.status !== 'error') {
+      const prev = at.get(row.pin);
+      if (prev !== undefined) {
+        rows[prev].status = 'dupe';
+        rows[prev].note = 'PIN repeats on line ' + (i + 1) + ', which wins';
+      }
+      at.set(row.pin, rows.length);
+    }
+    rows.push(row);
+  }
+  return { rows, over };
+}
+
+const PRI_LABEL = { 0: 'User', 2: 'Enroller', 6: 'Manager', 14: 'Super admin' };
+
+// What the paste would do to the records we already hold. Runs on the same
+// rows the push uses, so the preview cannot disagree with the result - and it
+// says which field moves, because a class roll pasted at the User role would
+// otherwise demote a super admin whose PIN happens to collide, silently.
+function gradeImport(rows, pri) {
+  for (const r of rows) {
+    if (r.status === 'error' || r.status === 'header' || r.status === 'dupe') continue;
+    const u = state.users[r.pin];
+    if (!u) { r.status = 'new'; continue; }
+    const was = [];
+    if (cmdField(u.name) !== r.name) was.push('name was "' + (cmdField(u.name) || 'blank') + '"');
+    if (r.card && String(u.card || '') !== r.card) was.push('card was ' + (u.card || 'blank'));
+    if (String(u.privilege || '0') !== pri) {
+      const old = String(u.privilege || '0');
+      was.push('role was ' + (PRI_LABEL[old] || old));
+    }
+    r.status = was.length ? 'update' : 'same';
+    r.note = [r.note, was.join(', ')].filter(Boolean).join(' - ');
+  }
+  const count = (k) => rows.filter((r) => r.status === k).length;
+  return {
+    lines: rows.length, new: count('new'), update: count('update'), same: count('same'),
+    dupe: count('dupe'), header: count('header'), error: count('error'),
+  };
+}
+
 async function handleApi(req, res, route, q) {
   // ---- HR read-only API, restricted to allow-listed IPs
   if (route.startsWith('/api/hr/')) {
@@ -1287,6 +1398,77 @@ async function handleApi(req, res, route, q) {
     });
   }
 
+  // Bulk import. One paste of "PIN<sep>Name" lines becomes one user record per
+  // line and one DATA UPDATE USERINFO per record, which the terminal collects
+  // on its next poll. dryRun grades the paste and changes nothing - that is
+  // what Preview calls, and it runs the same rows the push would send.
+  if (route === '/api/users/import' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    const pri = String(Number(p.pri) || 0);
+    const parsed = parseUserList(p.text);
+    const counts = gradeImport(parsed.rows, pri);
+    const wanted = parsed.rows.filter((r) => r.status === 'new' || r.status === 'update'
+      || (r.status === 'same' && !p.skipUnchanged));
+    counts.push = wanted.length;
+    const preview = { ok: true, dryRun: true, counts, rows: parsed.rows, over: parsed.over };
+    if (p.dryRun) return jsonOut(res, preview);
+
+    if (!wanted.length) {
+      return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
+        error: counts.error || counts.lines === 0
+          ? 'nothing to push - no usable line in the paste'
+          : 'nothing to push - every record already matches' }), 400);
+    }
+    const all = Object.keys(state.devices);
+    const online = all.filter((sn) => state.devices[sn].online);
+    const targets = p.sn ? [p.sn] : online;
+    if (!targets.length) {
+      return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
+        error: 'no terminal is online right now - ' + all.length
+          + ' known device(s), none polling this server' }), 409);
+    }
+    const batch = ++importSeq;
+    const queued = [];
+    for (const r of wanted) {
+      const u = state.users[r.pin] || (state.users[r.pin] = { pin: r.pin });
+      // no card column in the paste means "leave the card alone", so the stored
+      // one is what gets sent rather than a blank that would clear it
+      const card = r.card || u.card || '';
+      u.name = r.name;
+      u.card = card;
+      u.privilege = pri;
+      u.updated = Date.now();
+      for (const sn of targets) {
+        queued.push(enqueue(sn, buildCommand('adduser', { pin: r.pin, name: r.name, card, pri }),
+          { kind: 'adduser', batch, pin: r.pin }));
+      }
+    }
+    saveSoon();
+    trace('info', '', 'bulk import: ' + wanted.length + ' user record(s) -> '
+      + targets.length + ' terminal(s), batch ' + batch);
+    return jsonOut(res, Object.assign({}, preview, {
+      dryRun: false, batch, targets,
+      queued: queued.map((c) => ({ id: c.id, sn: c.sn, pin: c.pin })),
+    }));
+  }
+
+  // How far a paste actually got. Asking by batch keeps the browser from
+  // listing several hundred command ids back at us on every poll, and a
+  // terminal that rejects a record names the PIN it rejected.
+  if (route === '/api/users/import/status') {
+    const batch = Number(q.get('batch') || 0);
+    const items = Object.values(state.queue).flat().filter((c) => c.batch === batch);
+    const done = items.filter((c) => c.returned);
+    const bad = done.filter((c) => !returnedOk(c));
+    return jsonOut(res, {
+      batch, total: items.length,
+      sent: items.filter((c) => c.sent).length,
+      returned: done.length, failed: bad.length,
+      failures: bad.slice(0, 20).map((c) => ({ sn: c.sn, pin: c.pin || '', result: c.result })),
+    });
+  }
+
   if (route === '/api/role' && req.method === 'POST') {
     const p = JSON.parse((await readBody(req)) || '{}');
     const d = state.devices[p.sn];
@@ -1352,6 +1534,10 @@ h1{font-size:16px;margin:0;letter-spacing:.3px}
 .card .k{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
 .card .v{font-size:26px;font-weight:600;margin-top:4px}
 .cols{display:grid;gap:14px;grid-template-columns:1fr 340px}
+/* a grid track is as wide as its widest child unless told otherwise, and the
+   protocol trace is one long unwrapped line - without this the main column
+   stretches past the window and takes the side column off-screen with it */
+.cols>*{min-width:0}
 @media(max-width:980px){.cols{grid-template-columns:1fr}}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:14px}
 .panel>h2{margin:0;font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);
@@ -1372,8 +1558,12 @@ padding:7px 12px;font-size:12px;cursor:pointer;font-family:inherit}
 button:hover{border-color:var(--accent);color:#fff}
 button.p{background:var(--accent);border-color:var(--accent);color:#fff}
 button.d{border-color:rgba(239,68,68,.4);color:#f87171}
-input,select{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:7px;
+button:disabled,button.p:disabled{background:#21262d;border-color:var(--line);color:var(--dim);
+cursor:default;opacity:.65}
+input,select,textarea{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:7px;
 padding:7px 10px;font-size:13px;font-family:inherit;width:100%}
+textarea{resize:vertical;min-height:118px;line-height:1.65;white-space:pre;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .row>*{flex:0 0 auto}
 .btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
@@ -1390,7 +1580,7 @@ padding:7px 10px;font-size:13px;font-family:inherit;width:100%}
   .card{padding:10px 12px}.card .v{font-size:20px}
   h2{flex-wrap:wrap;gap:6px}
   .body.row>*{flex:1 1 auto;min-width:0}
-  input,select{width:100%}
+  input,select,textarea{width:100%}
   #aList{position:fixed;left:12px;right:12px;top:auto}
 }
 .hint b{color:var(--fg)}
@@ -1400,6 +1590,12 @@ code{background:#0d1117;border:1px solid var(--line);padding:1px 6px;border-radi
 .tag{font-size:10.5px;padding:2px 8px;border-radius:20px;background:#21262d;
 border:1px solid var(--line);color:var(--dim);white-space:nowrap}
 .tag.face{background:rgba(59,130,246,.16);color:#93c5fd;border-color:rgba(59,130,246,.4)}
+.st{font-size:10.5px;padding:2px 8px;border-radius:20px;background:#21262d;border:1px solid var(--line);
+color:var(--dim);white-space:nowrap}
+.st.new{background:rgba(34,197,94,.15);color:var(--ok);border-color:rgba(34,197,94,.35)}
+.st.update{background:rgba(59,130,246,.16);color:#93c5fd;border-color:rgba(59,130,246,.4)}
+.st.dupe,.st.header{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
+.st.error{background:rgba(239,68,68,.12);color:#f87171;border-color:rgba(239,68,68,.3)}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
 .seg button{border:0;border-radius:0;background:transparent;color:var(--dim);padding:7px 13px}
 .seg button:hover{color:#fff}
@@ -1665,6 +1861,41 @@ h1{font-size:15px}
         <div class="body" id="devBox"><div class="hint">No device has connected yet.</div></div>
       </div>
       <div class="panel">
+        <h2>Bulk import users
+          <span class="row">
+            <select id="bPri" style="width:120px">
+              <option value="0">User</option><option value="2">Enroller</option>
+              <option value="6">Manager</option><option value="14">Super admin</option>
+            </select>
+            <label class="hint" style="display:flex;align-items:center;gap:5px">
+              <input id="bSkip" type="checkbox" style="width:auto"> only new / changed
+            </label>
+          </span>
+        </h2>
+        <div class="body">
+          <p class="hint" style="margin:0 0 9px">Paste the roll as it comes &mdash; one person per line,
+          number first, then the name. A tab, a comma or a run of spaces all count as the column break,
+          and a heading row is ignored. <b>Preview</b> shows what was understood and changes nothing;
+          <b>Push</b> then sends one record per line to every online terminal in a single go.</p>
+          <textarea id="bText" rows="7" spellcheck="false"
+            placeholder="No.&#9;Student Name&#10;5001&#9;HASHIM SHAHAL K&#10;5002&#9;MUHAMMED JASIM&#10;5003&#9;MUHAMMED HIZAM"></textarea>
+          <div class="row" style="margin-top:9px">
+            <button onclick="bulkPreview()">Preview</button>
+            <button class="p" id="bPush" onclick="bulkPush()" disabled>Push to device</button>
+            <button onclick="bulkClear()">Clear</button>
+            <span class="note" id="bMsg" style="flex:1 1 160px"></span>
+          </div>
+          <div class="row" id="bCounts" style="margin-top:9px"></div>
+          <div class="scroll" id="bWrap" style="max-height:330px;margin-top:9px;display:none;border:1px solid var(--line);border-radius:8px">
+            <table><thead><tr><th>Line</th><th>PIN</th><th>Name</th><th>Card</th><th>Status</th></tr></thead>
+            <tbody id="bRows"></tbody></table>
+          </div>
+          <p class="hint" style="margin:10px 0 0">The face template still has to be enrolled at the
+          terminal. This creates the user records so the faces have something to be registered against
+          &mdash; at the terminal each of these numbers will already carry its name.</p>
+        </div>
+      </div>
+      <div class="panel">
         <h2>Protocol trace
           <span class="row">
             <input id="trq" placeholder="filter" style="width:130px" oninput="renderTrace()">
@@ -1720,7 +1951,8 @@ h1{font-size:15px}
             <button class="d" onclick="delUser()">Delete PIN</button>
           </div>
           <p class="hint" style="margin:10px 0 0">The face template still has to be enrolled at the terminal &mdash;
-          this creates the user record so the face can be registered against it.</p>
+          this creates the user record so the face can be registered against it.
+          A whole class at once goes through <b>Bulk import users</b>.</p>
         </div>
       </div>
 
@@ -2265,6 +2497,102 @@ function delUser(){
   if (!confirm('Delete user ' + pin + ' from the device?')) return;
   cmd('deluser', {pin: pin});
 }
+/* ------ bulk import: paste a roll, see what it means, push it in one go */
+var BULK = null, BULK_TIMER = null;
+var BULK_LABEL = {new:'new', update:'update', same:'unchanged', dupe:'repeat',
+                  header:'heading', error:'problem'};
+
+function bulkNote(msg){ q('bMsg').textContent = msg; }
+
+function bulkCall(dry){
+  return fetch('/api/users/import', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({text: q('bText').value, pri: q('bPri').value,
+      skipUnchanged: q('bSkip').checked, dryRun: dry})})
+    .then(function(r){ return r.json(); })
+    .catch(function(){ return {ok:false, error:'server unreachable'}; });
+}
+
+function bulkClear(){
+  clearTimeout(BULK_TIMER);
+  BULK = null;
+  q('bText').value = ''; q('bRows').innerHTML = ''; q('bCounts').innerHTML = '';
+  q('bWrap').style.display = 'none';
+  q('bPush').disabled = true; q('bPush').textContent = 'Push to device';
+  bulkNote('');
+}
+
+function bulkPreview(){
+  if (!q('bText').value.trim()) return bulkNote('paste the list first');
+  bulkNote('reading the paste...');
+  bulkCall(true).then(bulkShow);
+}
+
+function bulkShow(j){
+  BULK = j;
+  var rows = j.rows || [], c = j.counts || {};
+  q('bWrap').style.display = rows.length ? 'block' : 'none';
+  q('bRows').innerHTML = rows.map(function(r){
+    return '<tr><td class="mono">' + r.line + '</td><td class="mono">' + esc(r.pin) + '</td><td>'
+      + esc(r.name) + '</td><td class="mono">' + esc(r.card || '-') + '</td><td><span class="st '
+      + r.status + '">' + (BULK_LABEL[r.status] || r.status) + '</span>'
+      + (r.note ? ' <span class="hint">' + esc(r.note) + '</span>' : '') + '</td></tr>';
+  }).join('');
+  var chips = [];
+  ['new','update','same','dupe','error'].forEach(function(k){
+    if (c[k]) chips.push('<span class="st ' + k + '">' + c[k] + ' ' + BULK_LABEL[k] + '</span>');
+  });
+  if (j.over) chips.push('<span class="st error">' + j.over + ' line(s) over the limit, dropped</span>');
+  q('bCounts').innerHTML = chips.join(' ')
+    || '<span class="hint">nothing readable in that paste</span>';
+  q('bPush').disabled = !(c.push > 0);
+  q('bPush').textContent = c.push ? 'Push ' + c.push + ' to device' : 'Push to device';
+  if (j.error) return bulkNote(j.error);
+  if (j.dryRun) bulkNote(c.push ? 'ready - nothing has been sent yet' : 'nothing left to send');
+}
+
+function bulkPush(){
+  var n = BULK && BULK.counts ? BULK.counts.push : 0;
+  if (!n) return;
+  if (!confirm('Push ' + n + ' user record(s) to the terminal?')) return;
+  q('bPush').disabled = true;
+  bulkNote('queueing ' + n + ' record(s)...');
+  bulkCall(false).then(function(j){
+    bulkShow(j);
+    if (!j.ok) return;
+    q('bPush').disabled = true;
+    bulkNote('queued ' + j.queued.length + ' command(s) for ' + j.targets.length
+      + ' terminal(s) - collected on the next poll.');
+    BULK_TIMER = setTimeout(function(){ bulkWatch(j.batch, Date.now() + 180000); }, 1600);
+    refresh();
+  });
+}
+
+// Queued is only half the answer: what matters is what the terminal said back,
+// so keep asking until every record has a reply or the wait runs out.
+function bulkWatch(batch, deadline){
+  clearTimeout(BULK_TIMER);
+  fetch('/api/users/import/status?batch=' + batch)
+    .then(function(r){ return r.json(); })
+    .then(function(s){
+      var left = s.total - s.returned;
+      if (!left){
+        bulkNote(s.failed
+          ? (s.total - s.failed) + ' of ' + s.total + ' accepted, ' + s.failed + ' refused: '
+            + s.failures.map(function(f){ return 'PIN ' + f.pin + ' (' + f.result + ')'; }).join(', ')
+          : 'all ' + s.total + ' record(s) accepted by the terminal.');
+        return refresh();
+      }
+      if (Date.now() > deadline){
+        return bulkNote(s.returned + ' of ' + s.total + ' confirmed, ' + left
+          + ' unanswered - check the terminal is online and still polling.');
+      }
+      bulkNote(s.returned + ' of ' + s.total + ' confirmed'
+        + (s.failed ? ', ' + s.failed + ' refused' : '') + ' - waiting for the rest...');
+      BULK_TIMER = setTimeout(function(){ bulkWatch(batch, deadline); }, 3000);
+    })
+    .catch(function(){ bulkNote('lost contact with the server while waiting.'); });
+}
+
 function purge(){
   if (!confirm('Delete all attendance history stored on this server? The device keeps its own copy.')) return;
   fetch('/api/purge', {method:'POST'}).then(refresh);
