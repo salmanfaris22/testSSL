@@ -1496,11 +1496,53 @@ function hasLower(name) {
   return !!n && n !== n.toUpperCase();
 }
 
-function parseUserList(text, upper) {
+// A roll often arrives as bare names with no numbers at all. The office
+// numbers people in order, so a new name takes the highest number in use plus
+// one - not the lowest gap, which would drop a new student into a number that
+// was retired years ago. A name already on file keeps the number it already
+// has, because giving it a fresh one is precisely how a person ends up on the
+// terminal twice.
+function autoNumber(lines) {
+  const taken = new Set(Object.keys(state.users));
+  // a number written out in the paste is spoken for too, even on a later line
+  for (const raw of lines) {
+    const t = String(raw).trim();
+    if (!t) continue;
+    const pin = normPin(splitRow(t)[0] || '');
+    if (/^\d{1,9}$/.test(pin)) taken.add(pin);
+  }
+  let next = 0;
+  for (const p of taken) {
+    const n = Number(p);
+    if (Number.isFinite(n) && n > next) next = n;
+  }
+  next++;
+  const held = new Map();             // name key -> the PIN that name already has
+  for (const u of Object.values(state.users)) {
+    const k = nameKey(u.name);
+    if (!k) continue;
+    const pin = String(u.pin);
+    // someone already on file twice keeps the lower of the two numbers
+    if (!held.has(k) || Number(pin) < Number(held.get(k))) held.set(k, pin);
+  }
+  return {
+    held,
+    take() {
+      while (taken.has(String(next))) next++;
+      const pin = String(next);
+      taken.add(pin);
+      return pin;
+    },
+  };
+}
+
+function parseUserList(text, upper, auto) {
   const rows = [];
   const at = new Map();               // pin -> row index, so a repeat can void the first
   const byName = new Map();           // name key -> row indexes, so one person twice shows
   const lines = String(text || '').split(/\r?\n/);
+  const numbers = auto ? autoNumber(lines) : null;
+  const given = new Map();            // name key -> PIN handed out earlier in this paste
   let over = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -1509,28 +1551,49 @@ function parseUserList(text, upper) {
     // an empty middle field ("5001,,NAME") is a spreadsheet artefact, not a column
     const f = splitRow(line).map((x) => x.trim()).filter((x, j) => j === 0 || x !== '');
     const row = { line: i + 1, pin: '', name: '', card: '', status: '', note: '' };
-    let name = f.slice(1).join(' ');
+    const heading = !/^\d/.test(f[0] || '') && HEADER_RE.test(f[0] || '');
+    // A line that does not open with a number has no number column to split
+    // off: the whole of it is the name. Without auto-numbering that is still
+    // a broken row, which is what it was before.
+    const bare = !heading && !/^\d/.test(f[0] || '') && !!numbers;
+    const cols = bare ? f : f.slice(1);
+    let name = cols.join(' ');
     let card = '';
     // a trailing all-digit field is a card number - but only when there is a
     // name in front of it, so "5001  12345678" stays a (badly named) person
-    if (f.length > 2 && /^\d{4,20}$/.test(f[f.length - 1])) {
-      card = f[f.length - 1];
-      name = f.slice(1, -1).join(' ');
+    if (cols.length > 1 && /^\d{4,20}$/.test(cols[cols.length - 1])) {
+      card = cols[cols.length - 1];
+      name = cols.slice(0, -1).join(' ');
     }
     row.name = cmdField(name);
     // every name is stored in capitals, so a roll typed in mixed case reads
     // the same on the terminal as one typed in shouting
     if (upper) row.name = row.name.toUpperCase();
     row.card = card;
-    if (!/^\d/.test(f[0] || '') && HEADER_RE.test(f[0] || '')) {
+    if (heading) {
       row.pin = f[0];
       row.status = 'header';
       row.note = 'column heading, skipped';
       rows.push(row);
       continue;
     }
-    row.pin = normPin(f[0] || '');
-    if (!row.pin) { row.status = 'error'; row.note = 'no PIN on this line'; }
+    if (bare) {
+      const key = nameKey(row.name);
+      // the same name twice in one paste is one person, and a name already on
+      // file keeps its number - both are how a second record is avoided, and
+      // they are told apart because only one of them is a record that exists
+      const earlier = key && given.get(key);
+      const onFile = key && numbers.held.get(key);
+      if (!row.name) { row.status = 'error'; row.note = 'nothing on this line'; }
+      else if (earlier) { row.pin = earlier.pin; row.auto = 'again'; row.autoLine = earlier.line; }
+      else if (onFile) { row.pin = onFile; row.auto = 'held'; }
+      else { row.pin = numbers.take(); row.auto = 'fresh'; }
+      if (key && row.pin && !earlier) given.set(key, { pin: row.pin, line: row.line });
+    } else {
+      row.pin = normPin(f[0] || '');
+    }
+    if (row.status === 'error') { /* already judged */ }
+    else if (!row.pin) { row.status = 'error'; row.note = 'no PIN on this line'; }
     else if (!/^\d{1,9}$/.test(row.pin)) { row.status = 'error'; row.note = 'PIN must be a number'; }
     else if (!row.name) { row.status = 'error'; row.note = 'no name on this line'; }
     else if (row.name.length > NAME_MAX) {
@@ -1619,6 +1682,14 @@ function gradeImport(rows, pri) {
     r.note = [r.note, was.join(', ')].filter(Boolean).join(' - ');
   }
   for (const r of rows) {
+    if (r.auto === 'fresh') {
+      r.note = ['number ' + r.pin + ' assigned', r.note].filter(Boolean).join(' - ');
+    } else if (r.auto === 'held') {
+      r.note = ['matched to PIN ' + r.pin + ' already on file', r.note].filter(Boolean).join(' - ');
+    } else if (r.auto === 'again') {
+      r.note = ['same name as line ' + r.autoLine + ', so the same number ' + r.pin, r.note]
+        .filter(Boolean).join(' - ');
+    }
     if (!r.dup) continue;
     r.note = [r.note, 'same name already on PIN ' + r.dupOf.join(', ')]
       .filter(Boolean).join(' - ');
@@ -1627,6 +1698,9 @@ function gradeImport(rows, pri) {
   return {
     lines: rows.length, new: count('new'), update: count('update'), same: count('same'),
     dupe: count('dupe'), header: count('header'), error: count('error'),
+    // how many numbers this paste had to hand out, so the operator sees it
+    assigned: rows.filter((r) => r.auto === 'fresh').length,
+    matched: rows.filter((r) => r.auto === 'held').length,
     // what the duplicate view would send, so the button and the chip agree
     dup: rows.filter((r) => inPick(r, 'dup')).length,
     // every twin found, including the ones no pick can send
@@ -1882,6 +1956,44 @@ async function handleApi(req, res, route, q) {
     return res.end('﻿' + csv);
   }
 
+  // The roll as a spreadsheet, cut to a run of numbers. An office asks for
+  // "5001 to 5200", not for the whole file, so the range is the only filter -
+  // an open end simply means everything above or below it.
+  if (route === '/api/users.csv') {
+    const asNum = (v) => (v === null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+    const from = asNum(q.get('from'));
+    const to = asNum(q.get('to'));
+    const lo = from === null ? -Infinity : Math.min(from, to === null ? from : to);
+    const hi = to === null ? Infinity : Math.max(to, from === null ? to : from);
+    const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const rows = Object.values(state.users)
+      .filter((u) => {
+        const n = Number(u.pin);
+        return Number.isFinite(n) && n >= lo && n <= hi;
+      })
+      .sort((a, b) => Number(a.pin) - Number(b.pin));
+    const csv = ['PIN,Name,Card,Privilege,Face enrolled,Biometrics,Photo,Last updated']
+      .concat(rows.map((u) => {
+        const bio = Object.keys(u.bio || {});
+        return [
+          u.pin, cmdField(u.name), u.card || '',
+          PRI_LABEL[String(u.privilege || '0')] || u.privilege || 'User',
+          bio.some((k) => k === 'BIODATA' || k === 'FACE') ? 'yes' : 'no',
+          bio.join(' '), u.photo ? 'yes' : 'no',
+          u.updated ? new Date(u.updated).toISOString() : '',
+        ].map(esc).join(',');
+      }))
+      .join('\r\n');
+    const tag = (from === null && to === null) ? 'all'
+      : (from === null ? 'up-to-' + hi : to === null ? 'from-' + lo : lo + '-' + hi);
+    trace('info', '', 'users exported: ' + rows.length + ' record(s), range ' + tag);
+    res.writeHead(200, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="users-' + tag + '.csv"',
+    });
+    return res.end('\ufeff' + csv);
+  }
+
   if (route === '/api/cmd' && req.method === 'POST') {
     let p = {};
     try { p = JSON.parse(await readBody(req) || '{}'); } catch (e) {}
@@ -1944,14 +2056,15 @@ async function handleApi(req, res, route, q) {
     try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
     const pri = String(Number(p.pri) || 0);
     const upper = p.upper !== false;
-    const parsed = parseUserList(p.text, upper);
+    const auto = p.auto !== false;
+    const parsed = parseUserList(p.text, upper, auto);
     const counts = gradeImport(parsed.rows, pri);
     const pick = PICK[p.pick] ? p.pick : 'all';
     const wanted = parsed.rows.filter((r) => inPick(r, pick));
     counts.push = wanted.length;
     counts.pick = pick;
     const preview = {
-      ok: true, dryRun: true, upper, counts, rows: parsed.rows, over: parsed.over,
+      ok: true, dryRun: true, upper, auto, counts, rows: parsed.rows, over: parsed.over,
     };
     if (p.dryRun) return jsonOut(res, preview);
 
@@ -2478,6 +2591,7 @@ h1{font-size:15px}
         <button class="p" id="uFix" onclick="fixCase()">UPPERCASE</button>
         <button id="uDup" onclick="toggleDupes()">duplicates</button>
         <button class="d" id="uDrop" onclick="dropDupes()">Remove duplicates</button>
+        <button onclick="exportUsers()">Export</button>
         <button onclick="cmd('queryuser')">Pull from device</button>
       </span>
     </h2>
@@ -2582,6 +2696,10 @@ h1{font-size:15px}
               title="Store every name in capital letters">
               <input id="bUpper" type="checkbox" checked style="width:auto" onchange="bulkRegrade()">CAPS
             </label>
+            <label class="hint" style="display:flex;align-items:center;gap:5px"
+              title="A line with no number gets the next one after the highest in use">
+              <input id="bAuto" type="checkbox" checked style="width:auto" onchange="bulkRegrade()">Auto #
+            </label>
             <span class="seg" id="bPick">
               <button class="on" onclick="setPick('all')" id="pkall">All</button>
               <button onclick="setPick('new')" id="pknew">New</button>
@@ -2597,6 +2715,8 @@ h1{font-size:15px}
           <div class="row" style="margin-top:9px">
             <button onclick="bulkPreview()">Preview</button>
             <button class="p" id="bPush" onclick="bulkPush()" disabled>Push to device</button>
+            <button id="bDropDup" onclick="dropDupeLines()" style="display:none"></button>
+            <button id="bSeeDup" onclick="reviewDupes()" style="display:none"></button>
             <button onclick="bulkClear()">Clear</button>
             <span class="note" id="bMsg" style="flex:1 1 160px"></span>
           </div>
@@ -3006,6 +3126,57 @@ function toggleLower(){
 }
 
 function userNote(msg){ q('uMsg').textContent = msg; }
+
+// The office asks for a run of numbers - "5001 to 5200" - so the range is
+// what the popup asks for, prefilled with the span actually on file. An end
+// left blank means no bound on that side rather than zero.
+function exportUsers(){
+  var pins = (PEOPLE || []).map(function(u){ return Number(u.pin); })
+    .filter(function(n){ return isFinite(n); }).sort(function(a, b){ return a - b; });
+  var lo = pins.length ? pins[0] : '', hi = pins.length ? pins[pins.length - 1] : '';
+  q('mTitle').textContent = 'Export users';
+  q('mDate').textContent = pins.length
+    ? pins.length + ' on file, numbered ' + lo + ' to ' + hi : 'no users on file yet';
+  q('mBody').innerHTML = '<div style="padding:12px 0">'
+    + '<div class="row" style="align-items:flex-end">'
+    + '<label class="hint" style="flex:1;min-width:110px">From PIN<br>'
+    + '<input id="exFrom" type="number" value="' + lo + '" style="margin-top:4px"></label>'
+    + '<label class="hint" style="flex:1;min-width:110px">To PIN<br>'
+    + '<input id="exTo" type="number" value="' + hi + '" style="margin-top:4px"></label>'
+    + '<button class="p" onclick="exportGo()" style="flex:0 0 auto">Download CSV</button>'
+    + '</div>'
+    + '<div class="note" id="exMsg" style="margin-top:10px"></div>'
+    + '<div class="note" style="margin-top:10px">Leave an end blank for no limit on that '
+    + 'side. The file carries PIN, name, card, role, whether a face is enrolled, and '
+    + 'whether a photo has been synced.</div>'
+    + '</div>';
+  exportCount();
+  q('exFrom').oninput = exportCount;
+  q('exTo').oninput = exportCount;
+  q('modal').style.display = 'block';
+}
+
+// say how many the range covers before anything is downloaded
+function exportCount(){
+  var from = q('exFrom').value, to = q('exTo').value;
+  var lo = from === '' ? -Infinity : Number(from);
+  var hi = to === '' ? Infinity : Number(to);
+  if (lo > hi){ var t = lo; lo = hi; hi = t; }
+  var n = (PEOPLE || []).filter(function(u){
+    var v = Number(u.pin);
+    return isFinite(v) && v >= lo && v <= hi;
+  }).length;
+  q('exMsg').innerHTML = n
+    ? '<b>' + n + '</b> user(s) in this range'
+    : '<span style="color:var(--warn)">No user has a number in this range</span>';
+}
+
+function exportGo(){
+  var p = [];
+  if (q('exFrom').value !== '') p.push('from=' + encodeURIComponent(q('exFrom').value));
+  if (q('exTo').value !== '') p.push('to=' + encodeURIComponent(q('exTo').value));
+  window.location = '/api/users.csv' + (p.length ? '?' + p.join('&') : '');
+}
 
 // Removing one record by hand. Which of a pair to keep is sometimes a call
 // only the office can make - this is where they make it - so the confirm
@@ -3518,6 +3689,12 @@ function bulkLabel(){
   var n = pickCount(BULK && BULK.counts);
   q('bPush').disabled = !n;
   q('bPush').textContent = n ? 'Push ' + n + ' to device' : 'Push to device';
+  var dl = dupeLines().length;
+  q('bDropDup').style.display = dl ? '' : 'none';
+  q('bDropDup').textContent = 'Drop ' + dl + ' duplicate line' + (dl === 1 ? '' : 's');
+  var onFile = (BULK && BULK.counts && BULK.counts.dupAll) || 0;
+  q('bSeeDup').style.display = onFile ? '' : 'none';
+  q('bSeeDup').textContent = 'Review ' + onFile + ' on file \\u2192';
 }
 
 function bulkReady(c){
@@ -3534,15 +3711,55 @@ function labelSegs(c){
   q('pkdup').textContent = 'Dupes' + n('dup');
 }
 
-// the grade depends on the CAPS toggle, so flipping it re-reads the same paste
+// the grade depends on the toggles, so flipping one re-reads the same paste
 function bulkRegrade(){
   if (BULK && q('bText').value.trim()) bulkPreview();
+}
+
+// Which lines name someone already on file under another number. They are the
+// lines that would make a second record if they were pushed.
+function dupeLines(){
+  var out = [];
+  ((BULK && BULK.rows) || []).forEach(function(r){
+    if (r.dup && SENDABLE.indexOf(r.status) >= 0) out.push(r);
+  });
+  return out;
+}
+
+// Take them out of the paste rather than off the terminal: nothing is deleted
+// anywhere, the text box just stops asking for a record that already exists.
+function dropDupeLines(){
+  var rows = dupeLines();
+  if (!rows.length) return bulkNote('no duplicate line in this paste');
+  var sample = rows.slice(0, 6).map(function(r){
+    return 'line ' + r.line + '  ' + r.pin + ' ' + r.name
+      + '  (already on PIN ' + (r.dupOf || []).join(', ') + ')';
+  }).join('\\n');
+  if (!confirm('Take ' + rows.length + ' duplicate line(s) out of the paste?\\n\\n' + sample
+    + (rows.length > 6 ? '\\n...and ' + (rows.length - 6) + ' more' : '')
+    + '\\n\\nNothing on the terminal is touched - only the text above changes.')) return;
+  var kill = {};
+  rows.forEach(function(r){ kill[r.line] = 1; });
+  q('bText').value = q('bText').value.split(/\\r?\\n/)
+    .filter(function(l, i){ return !kill[i + 1]; }).join('\\n');
+  bulkNote(rows.length + ' duplicate line(s) removed from the paste');
+  bulkPreview();
+}
+
+// The other half of the same problem: the records already on file. That is a
+// deletion, so it happens where deletions happen, with the pairs side by side.
+function reviewDupes(){
+  showTab('log');
+  if (!DUPONLY) toggleDupes();
+  else if (!DUPES) loadDupes();
+  var box = q('tbUsers');
+  if (box && box.scrollIntoView) box.scrollIntoView({block: 'center'});
 }
 
 function bulkCall(dry){
   return fetch('/api/users/import', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({text: q('bText').value, pri: q('bPri').value,
-      pick: PICK, upper: q('bUpper').checked, dryRun: dry})})
+      pick: PICK, upper: q('bUpper').checked, auto: q('bAuto').checked, dryRun: dry})})
     .then(function(r){ return r.json(); })
     .catch(function(){ return {ok:false, error:'server unreachable'}; });
 }
@@ -3553,6 +3770,7 @@ function bulkClear(){
   q('bText').value = ''; q('bRows').innerHTML = ''; q('bCounts').innerHTML = '';
   q('bWrap').style.display = 'none';
   q('bPush').disabled = true; q('bPush').textContent = 'Push to device';
+  q('bDropDup').style.display = 'none'; q('bSeeDup').style.display = 'none';
   labelSegs(null);
   bulkNote('');
 }
@@ -3585,6 +3803,13 @@ function bulkShow(j){
   });
   if (j.over) chips.push('<span class="st error">' + j.over + ' line(s) over the limit, dropped</span>');
   var head = chips.length ? '<span class="hint">never sent:</span> ' + chips.join(' ') : '';
+  if (c.assigned || c.matched){
+    var made = [];
+    if (c.assigned) made.push('<span class="st new">' + c.assigned + ' number(s) assigned</span>');
+    if (c.matched) made.push('<span class="st update">' + c.matched
+      + ' matched to a number on file</span>');
+    head += (head ? '<span class="hint" style="margin:0 8px">&middot;</span>' : '') + made.join(' ');
+  }
   if (c.dupAll){
     head += (head ? '<span class="hint" style="margin:0 8px">&middot;</span>' : '')
       + '<span class="hint">already on file twice:</span> <span class="st dup">'
