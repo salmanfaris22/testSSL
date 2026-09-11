@@ -1220,6 +1220,46 @@ function syncEvents(pins, from, to, face) {
     : Number(a.connect_id) - Number(b.connect_id)));
 }
 
+// One person's day as the academy stores it: the bracket it draws on screen -
+// when they arrived, when they left, the break between - with the movements
+// behind it. A day that ends on an arrival has no departure to report, and
+// says pending rather than inventing one.
+function syncDays(pins, from, to, face) {
+  const out = [];
+  for (const pin of pins) {
+    const name = (state.users[pin] && cmdField(state.users[pin].name)) || '';
+    for (const date of dateRange(from, to)) {
+      const day = hrDay(pin, date, face);
+      if (!day) continue;
+      const at = (label) => {
+        const step = day.steps.find((x) => x.step === label);
+        return step ? isoStamp(step.time) : '';
+      };
+      out.push({
+        connect_id: pin,
+        employee_name: name || day.name || '',
+        session_date: date,
+        site_name: day.steps.length ? day.steps[0].gate : '',
+        check_in_at: isoStamp(day.check_in),
+        check_out_at: day.pending ? '' : isoStamp(day.check_out),
+        break_start_at: at('Break start'),
+        break_end_at: at('Break end'),
+        checkout_status: day.pending ? 'pending' : (day.check_out ? 'closed' : 'none'),
+        total_minutes: day.total_minutes,
+        break_minutes: day.break_minutes,
+        work_minutes: day.work_minutes,
+        events: day.steps.filter((x) => x.event_type).map((x) => ({
+          event_type: x.event_type,
+          timestamp: isoStamp(x.time),
+          address: x.gate,
+        })),
+      });
+    }
+  }
+  return out.sort((a, b) => (a.session_date < b.session_date ? -1
+    : a.session_date > b.session_date ? 1 : Number(a.connect_id) - Number(b.connect_id)));
+}
+
 // "2026-09-11 09:05:00" as local time, written with its offset so the far end
 // cannot read it as UTC and move everyone's day by five and a half hours.
 function isoStamp(local) {
@@ -2006,6 +2046,58 @@ async function handleApi(req, res, route, q) {
     }
 
     if (route === '/api/v1/sync/stream') return openFeed(req, res, q, route, t0);
+
+    // The academy asks for whole days, not loose movements: one row per person
+    // per day carrying the bracket - arrival, departure, the break between -
+    // with the movements behind it. hrDay already computes exactly that.
+    if (route === '/api/v1/sync/attendance') {
+      const pins = pinList(q, 'connect_id');
+      if (!pins.length) {
+        return jsonOut(res, { data: { items: [], total: 0, page: 1, limit: 0,
+          note: 'name the people with connect_id - this feed never returns the whole roll' } });
+      }
+      const today = localDate(new Date());
+      const end = q.get('end_date') || today;
+      const start = q.get('start_date') || end;
+      const page = Math.max(1, Number(q.get('page')) || 1);
+      const limit = Math.min(Math.max(Number(q.get('limit')) || 200, 1), 1000);
+      const items = syncDays(pins, start, end, faceOnly(q));
+      const from = (page - 1) * limit;
+      return jsonOut(res, { data: {
+        items: items.slice(from, from + limit), total: items.length, page, limit,
+      } });
+    }
+
+    // The roll, for the screen that puts a Connect ID onto a person. Everyone
+    // here is on the same door, so there is one department rather than none -
+    // an empty list would leave that screen with nothing to choose.
+    if (route === '/api/v1/sync/departments') {
+      return jsonOut(res, { data: [{
+        uid: 'gate', name: 'Face terminal', people_count: Object.keys(state.users).length,
+      }] });
+    }
+
+    if (route === '/api/v1/sync/people') {
+      const dept = String(q.get('department') || '');
+      if (dept && dept !== 'gate') return jsonOut(res, { data: [] });
+      const people = Object.values(state.users)
+        .sort((a, b) => Number(a.pin) - Number(b.pin))
+        .map((u) => ({
+          connect_id: String(u.pin),
+          employee_name: cmdField(u.name),
+          department_name: 'Face terminal',
+          email: '',
+          has_face: !!(u.bio && (u.bio.BIODATA || u.bio.FACE)),
+        }));
+      return jsonOut(res, { data: people, total: people.length });
+    }
+
+    // The terminals record arrivals and departures, not what anyone worked on,
+    // so this is answered honestly rather than invented.
+    if (route === '/api/v1/sync/work-logs') {
+      return jsonOut(res, { data: { items: [], total: 0, page: 1, limit: 0,
+        note: 'a face terminal records attendance, not work logs' } });
+    }
 
     if (route === '/api/v1/sync/events') {
       // Empty means nobody here, not everybody. This feed exists to carry the
