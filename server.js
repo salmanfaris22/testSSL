@@ -2172,6 +2172,8 @@ color:var(--dim);white-space:nowrap}
 .st.keep{background:rgba(34,197,94,.15);color:var(--ok);border-color:rgba(34,197,94,.35)}
 .st.drop{background:rgba(239,68,68,.12);color:#f87171;border-color:rgba(239,68,68,.3)}
 .st.hold{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
+button.rm{padding:3px 9px;font-size:11px;border-color:rgba(239,68,68,.35);color:#f87171}
+button.rm:hover{border-color:#f87171;background:rgba(239,68,68,.12);color:#fca5a5}
 /* a row the current pick would not send - still listed, visibly not going */
 #bRows tr.skip{opacity:.38}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
@@ -2380,7 +2382,8 @@ h1{font-size:15px}
       </label>
     </div>
     <div class="scroll" style="max-height:300px">
-      <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
+      <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th>
+      <th></th></tr></thead>
       <tbody id="tbUsers"></tbody></table>
       <div class="empty" id="emptyUsers">No users synced yet &mdash; press <b>Pull from device</b>.</div>
     </div>
@@ -2838,11 +2841,11 @@ function loadDupes(then){
       if (!j || !j.ok) { userNote('could not read the duplicates'); return; }
       DUPES = {};
       j.groups.forEach(function(g){
-        DUPES[g.keep.pin] = {role:'keep', why:g.keep.why, holds:[],
+        DUPES[g.keep.pin] = {role:'keep', why:g.keep.why, holds:[], group:g.keep.pin,
           twin:g.drop.map(function(d){ return d.pin; }).join(', ')};
         g.drop.forEach(function(d){
           DUPES[d.pin] = {role: d.holds.length ? 'hold' : 'drop', why:d.why,
-            holds:d.holds, twin:g.keep.pin};
+            holds:d.holds, twin:g.keep.pin, group:g.keep.pin};
         });
       });
       DUPES.summary = {pairs:j.pairs, removable:j.removable, held:j.held};
@@ -2909,6 +2912,25 @@ function toggleLower(){
 
 function userNote(msg){ q('uMsg').textContent = msg; }
 
+// Removing one record by hand. Which of a pair to keep is sometimes a call
+// only the office can make - this is where they make it - so the confirm
+// says what is attached to this number rather than just asking twice.
+function removeUser(pin){
+  var u = (PEOPLE || []).filter(function(x){ return String(x.pin) === String(pin); })[0];
+  if (!u) return;
+  var d = DUPES && DUPES[String(pin)];
+  var face = u.bio && Object.keys(u.bio).length;
+  if (!confirm('Remove PIN ' + pin + ' ' + (u.name || '') + ' from this server and the terminal?'
+    + (d ? '\\n\\nThe other record for this name is PIN ' + d.twin + '.' : '')
+    + (face ? '\\n\\nA face is enrolled on this record and goes with it.' : '')
+    + '\\n\\nPunches already recorded under this number stay on the server, but stop being '
+    + 'reported once the record is gone.')) return;
+  userNote('removing PIN ' + pin + ' ' + (u.name || '') + '...');
+  cmd('deluser', {pin: String(pin)});
+  DUPES = null;                       // the pairs have changed, so read them again
+  setTimeout(loadDupes, 600);
+}
+
 // What the UPPERCASE button would act on: whatever is listed right now, so
 // both the text filter and the small-letters toggle narrow it.
 function lowerShown(){
@@ -2923,7 +2945,17 @@ function visibleUsers(){
       || String(u.name || '').toLowerCase().indexOf(term) >= 0;
   });
   if (LOWONLY) list = list.filter(function(u){ return isLower(u.name); });
-  if (DUPONLY) list = list.filter(function(u){ return DUPES && DUPES[String(u.pin)]; });
+  if (DUPONLY && DUPES){
+    var want = {};
+    list.forEach(function(u){
+      var d = DUPES[String(u.pin)];
+      if (d) want[d.group] = 1;
+    });
+    list = (PEOPLE || []).filter(function(u){
+      var d = DUPES[String(u.pin)];
+      return d && want[d.group];
+    });
+  } else if (DUPONLY) list = [];
   return list;
 }
 
@@ -2932,8 +2964,7 @@ function byGroup(list){
   if (!DUPONLY || !DUPES) return list;
   return list.slice().sort(function(a, b){
     var x = DUPES[String(a.pin)] || {}, y = DUPES[String(b.pin)] || {};
-    var ax = x.role === 'keep' ? a.pin : x.twin, ay = y.role === 'keep' ? b.pin : y.twin;
-    if (Number(ax) !== Number(ay)) return Number(ax) - Number(ay);
+    if (Number(x.group) !== Number(y.group)) return Number(x.group) - Number(y.group);
     return (x.role === 'keep' ? 0 : 1) - (y.role === 'keep' ? 0 : 1);
   });
 }
@@ -2952,7 +2983,9 @@ function renderUsers(){
       + (isLower(u.name) ? ' <span class="st low">small letters</span>' : '') + dup + '</td>'
       + '<td class="mono">' + esc(u.card || '') + '</td>'
       + '<td>' + esc(PRIVILEGE[u.privilege] || u.privilege || 'User') + '</td>'
-      + '<td style="color:#8b949e">' + esc(bio) + '</td></tr>';
+      + '<td style="color:#8b949e">' + esc(bio) + '</td>'
+      + '<td style="text-align:right"><button class="rm" onclick="removeUser(\\''
+      + esc(u.pin) + '\\')">Remove</button></td></tr>';
   }).join('');
   var low = (PEOPLE || []).filter(function(u){ return isLower(u.name); }).length;
   q('uLow').textContent = 'small letters' + (low ? ' ' + low : '');
