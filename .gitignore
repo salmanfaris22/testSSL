@@ -5,3 +5,6 @@ data/photos/
 
 # Copies the server makes before rewriting a store it did not recognise.
 *.server-backup
+
+# The HR door's access log. Grows per call and is local operational history.
+data/hrlog.jsonl

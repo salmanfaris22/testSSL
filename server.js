@@ -33,6 +33,10 @@ const PHOTO_MAX = 1024 * 1024;   // an enrolment snapshot, not a photo library
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
 const SET_FILE = path.join(DATA_DIR, 'settings.json');
 const MARK_FILE = path.join(DATA_DIR, 'marks.json');
+// Who has been through the HR door. Employee attendance leaves this server
+// through that API, so every call - admitted or refused - is written down.
+const HRLOG_FILE = path.join(DATA_DIR, 'hrlog.jsonl');
+const HRLOG_MAX = 2000;   // kept in memory; the file keeps the rest
 const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
 // The terminals stamp punches with their own clock, which is rarely Indian
 // time: one left on UTC is 330 min behind, one set to GMT+5:00 is 30 min
@@ -212,6 +216,8 @@ const state = {
   settings: { allowIps: [], faceOnly: undefined, dwellSec: undefined, doorPin: '' },
 };
 const seen = new Set();          // dedupe key for punches
+const hrLog = [];                // recent HR API calls, newest last
+const feeds = [];                // open live streams: {res, ip, pins, since, sent}
 let cmdSeq = Date.now() % 100000;
 
 function loadState() {
@@ -225,6 +231,14 @@ function loadState() {
   } catch (e) { /* first run */ }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
   try { state.marks = JSON.parse(fs.readFileSync(MARK_FILE, 'utf8')); } catch (e) {}
+  // only the tail: this file grows with every call and none of it is needed
+  // beyond what the panel shows
+  try {
+    const lines = fs.readFileSync(HRLOG_FILE, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines.slice(-HRLOG_MAX)) {
+      try { hrLog.push(JSON.parse(line)); } catch (e) { /* skip a torn line */ }
+    }
+  } catch (e) { /* no calls yet */ }
   try { Object.assign(state.settings, JSON.parse(fs.readFileSync(SET_FILE, 'utf8'))); } catch (e) {}
   try {
     state.devices = JSON.parse(fs.readFileSync(DEV_FILE, 'utf8'));
@@ -584,8 +598,30 @@ function textOut(res, body, code) {
   res.end(b);
 }
 
+// How many records a reply actually carried. Each HR route names its rows
+// differently, so the count is taken from whichever list is present rather
+// than from a field every route would have to remember to set.
+function rowCount(obj) {
+  if (!obj || typeof obj !== 'object') return 0;
+  for (const k of ['users', 'punches', 'days', 'employees', 'devices', 'events', 'rows']) {
+    if (Array.isArray(obj[k])) return obj[k].length;
+  }
+  if (obj.data && Array.isArray(obj.data.items)) return obj.data.items.length;
+  return 0;
+}
+
 function jsonOut(res, obj, code) {
   const b = Buffer.from(JSON.stringify(obj), 'utf8');
+  // an HR call logs itself as it answers, so a new route cannot forget to
+  if (res._hr) {
+    const h = res._hr;
+    res._hr = null;
+    hrTrace(h.req, h.route, {
+      pins: h.pins, rows: rowCount(obj), ok: (code || 200) < 400,
+      why: (code || 200) < 400 ? '' : (obj && obj.error) || String(code),
+      ms: Date.now() - h.t0,
+    });
+  }
   res.writeHead(code || 200, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': b.length,
@@ -1229,9 +1265,84 @@ function filterLogs(q, opts) {
     .map((r) => Object.assign({ dir: dirOf(r) }, r));
 }
 
+// The socket peer is a fact; X-Forwarded-For is a claim anybody who can reach
+// the port is free to make. Honouring it unconditionally meant the allow-list
+// could be walked straight past by sending one header, so the claim is only
+// believed when it arrives from a proxy we were told to expect.
+const TRUST_PROXY = String(process.env.TRUST_PROXY || '')
+  .split(',').map((x) => x.trim()).filter(Boolean);
+
+function peerIp(req) {
+  return String((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+}
+
 function clientIp(req) {
+  const peer = peerIp(req);
+  if (!TRUST_PROXY.length) return peer;
+  if (!TRUST_PROXY.some((rule) => ipMatches(rule, peer))) return peer;
   const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return (fwd || req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  return (fwd || peer).replace(/^::ffff:/, '');
+}
+
+// The door's own history, grouped by who knocked. An address that was turned
+// away is the useful row here: it carries the exact string to allow-list, so
+// the fix is a copy rather than a guess.
+function hrLogView(q) {
+  const limit = Math.min(Math.max(Number(q && q.get && q.get('limit')) || 120, 1), 500);
+  const by = new Map();
+  for (const r of hrLog) {
+    const seenIp = by.get(r.ip) || {
+      ip: r.ip, calls: 0, denied: 0, rows: 0, first: r.t, last: 0,
+      lastRoute: '', lastWhy: '', allowed: false, pins: '',
+    };
+    seenIp.calls++;
+    if (!r.ok) { seenIp.denied++; seenIp.lastWhy = r.why; }
+    seenIp.rows += Number(r.rows) || 0;
+    if (r.t >= seenIp.last) { seenIp.last = r.t; seenIp.lastRoute = r.route; seenIp.pins = r.pins; }
+    by.set(r.ip, seenIp);
+  }
+  const callers = [...by.values()].sort((a, b) => b.last - a.last);
+  // said plainly, rather than left for the operator to work out from the rules
+  for (const c of callers) {
+    c.rule = ruleFor(c.ip);
+    c.allowed = !!c.rule;
+  }
+  return {
+    total: hrLog.length,
+    allowIps: state.settings.allowIps || [],
+    trustProxy: TRUST_PROXY,
+    keySet: !!state.settings.hrKey,
+    callers,
+    feeds: feedList(),
+    calls: hrLog.slice(-limit).reverse(),
+  };
+}
+
+// Who is holding a live stream open right now. Empty until a feed connects.
+function feedList() {
+  return feeds.map((f) => ({
+    ip: f.ip, pins: [...f.pins].join(','), since: f.since, sent: f.sent,
+  }));
+}
+
+// which rule admits this address, '' when none does
+function ruleFor(ip) {
+  for (const rule of state.settings.allowIps || []) {
+    if (ipMatches(rule, ip)) return rule;
+  }
+  return '';
+}
+
+// One row per call at the HR door. `why` is empty when the call was admitted.
+function hrTrace(req, route, info) {
+  const row = Object.assign({
+    t: Date.now(), ip: clientIp(req), peer: peerIp(req), route,
+    pins: '', rows: 0, ok: true, why: '', ms: 0,
+  }, info || {});
+  hrLog.push(row);
+  if (hrLog.length > HRLOG_MAX) hrLog.splice(0, hrLog.length - HRLOG_MAX);
+  try { fs.appendFileSync(HRLOG_FILE, JSON.stringify(row) + '\n'); } catch (e) { /* best effort */ }
+  return row;
 }
 
 // An HR server rarely calls from one fixed address - a NAT gateway, a pool of
@@ -1711,10 +1822,18 @@ function gradeImport(rows, pri) {
 async function handleApi(req, res, route, q) {
   // ---- HR read-only API, restricted to allow-listed IPs
   if (route.startsWith('/api/hr/')) {
+    // the dashboard's own view of the door - local UI data about who knocked,
+    // so it is not behind the door it describes
+    if (route === '/api/hr/log') return jsonOut(res, hrLogView(q));
+    const t0 = Date.now();
     if (!ipAllowed(req)) {
-      trace('err', '', 'HR API denied for ' + clientIp(req));
+      const why = (state.settings.allowIps || []).length
+        ? 'address not on the allow-list' : 'allow-list is empty, so nobody is admitted';
+      hrTrace(req, route, { pins: q.get('pin') || '', ok: false, why, ms: Date.now() - t0 });
+      trace('err', '', 'HR API denied for ' + clientIp(req) + ' - ' + why);
       return jsonOut(res, { error: 'forbidden', ip: clientIp(req) }, 403);
     }
+    res._hr = { req, route, pins: q.get('pin') || '', t0 };
     const today = localDate(new Date());
     const to = q.get('to') || today;
     const from = q.get('from') || to;
@@ -2866,6 +2985,33 @@ h1{font-size:15px}
       </div>
     </div>
   </div>
+
+  <div class="panel">
+    <h2>Who is calling the HR API
+      <span class="row">
+        <span class="note" id="hrLogSum"></span>
+        <button onclick="loadHrLog()">Refresh</button>
+      </span>
+    </h2>
+    <div class="body">
+      <div class="note" style="margin-bottom:10px">Every call at the HR door, admitted or refused,
+      with the address it came from. An address that was turned away carries the exact string to
+      paste into the allow-list above &mdash; so the fix is a copy, not a guess.</div>
+      <div id="hrFeeds"></div>
+      <div class="scroll" style="max-height:240px">
+        <table><thead><tr><th>Address</th><th>State</th><th>Calls</th><th>Refused</th>
+        <th>Records sent</th><th>Last call</th></tr></thead>
+        <tbody id="hrCallers"></tbody></table>
+        <div class="empty" id="hrNone">Nobody has called the HR API yet.</div>
+      </div>
+      <div class="hint" style="margin:14px 0 6px">Recent calls</div>
+      <div class="scroll" style="max-height:280px">
+        <table><thead><tr><th>Time</th><th>Address</th><th>Endpoint</th><th>People asked for</th>
+        <th>Records</th><th>Took</th></tr></thead>
+        <tbody id="hrCalls"></tbody></table>
+      </div>
+    </div>
+  </div>
 </section>
 
 </div>
@@ -2991,7 +3137,7 @@ function showTab(name){
   if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
   if (name === 'door') loadDoor();
   if (name === 'info') loadStats();
-  if (name === 'srv') loadIps();
+  if (name === 'srv') { loadIps(); loadHrLog(); }
   refresh();
 }
 document.getElementById('tabs').addEventListener('click', function(e){
@@ -3014,6 +3160,7 @@ function boot(){
   showTab(saved);
   loadIps();
   setInterval(function(){ if (TAB === 'info') loadStats(); }, 30000);
+  setInterval(function(){ if (TAB === 'srv') loadHrLog(); }, 10000);
   setInterval(function(){ if (TAB === 'door') loadDoor(); }, 5000);
 }
 
@@ -4346,6 +4493,55 @@ function loadStats(){
       + card('sm', 'Host', esc(t.host.hostname || '?'))
       + card('sm', 'PID', t.proc.pid)
       + '</div>';
+  });
+}
+
+// The door's log. Local UI data about who knocked, so it is not itself behind
+// the door it describes.
+function loadHrLog(){
+  fetch('/api/hr/log').then(function(r){ return r.json(); }).then(function(j){
+    var callers = j.callers || [], calls = j.calls || [];
+    q('hrNone').style.display = callers.length ? 'none' : 'block';
+    q('hrLogSum').textContent = j.total
+      ? j.total + ' call(s) from ' + callers.length + ' address(es)'
+      : 'no calls yet';
+    q('hrCallers').innerHTML = callers.map(function(c){
+      return '<tr><td class="mono">' + esc(c.ip) + '</td>'
+        + '<td>' + (c.allowed
+            ? '<span class="st new">admitted</span> <span class="hint">by ' + esc(c.rule) + '</span>'
+            : '<span class="st error">refused</span>'
+              + (c.lastWhy ? ' <span class="hint">' + esc(c.lastWhy) + '</span>' : '')
+              + ' <button class="vw" onclick="addIp(\\'' + esc(c.ip) + '\\')">Allow</button>')
+        + '</td>'
+        + '<td class="mono">' + num(c.calls) + '</td>'
+        + '<td class="mono">' + (c.denied
+            ? '<span style="color:#f87171">' + num(c.denied) + '</span>' : '0') + '</td>'
+        + '<td class="mono">' + num(c.rows) + '</td>'
+        + '<td>' + esc(stampOf(c.last)) + ' <span class="hint">' + ago(c.last) + '</span></td></tr>';
+    }).join('');
+    q('hrCalls').innerHTML = calls.map(function(r){
+      return '<tr' + (r.ok ? '' : ' style="opacity:.75"') + '>'
+        + '<td class="mono">' + esc(stampOf(r.t)) + '</td>'
+        + '<td class="mono">' + esc(r.ip)
+        + (r.peer && r.peer !== r.ip ? ' <span class="hint">via ' + esc(r.peer) + '</span>' : '')
+        + '</td>'
+        + '<td class="mono">' + esc(r.route)
+        + (r.ok ? '' : ' <span class="st error">refused</span>'
+            + (r.why ? ' <span class="hint">' + esc(r.why) + '</span>' : '')) + '</td>'
+        + '<td class="mono">' + (r.pins ? esc(r.pins) : '<span class="hint">everyone</span>') + '</td>'
+        + '<td class="mono">' + (r.ok ? num(r.rows) : '&mdash;') + '</td>'
+        + '<td class="mono hint">' + (r.ms || 0) + ' ms</td></tr>';
+    }).join('');
+    var feeds = j.feeds || [];
+    q('hrFeeds').innerHTML = feeds.length
+      ? '<div class="note" style="margin-bottom:10px"><b>Live feeds open:</b> '
+        + feeds.map(function(f){
+            return '<span class="st new">' + esc(f.ip) + '</span> <span class="hint">'
+              + (f.pins ? f.pins.split(',').length + ' people' : 'nobody')
+              + ' &middot; ' + num(f.sent) + ' sent &middot; since ' + esc(stampOf(f.since))
+              + '</span>';
+          }).join(' &middot; ') + '</div>'
+      : '';
   });
 }
 
