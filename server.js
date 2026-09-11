@@ -2079,8 +2079,11 @@ async function handleApi(req, res, route, q) {
 
     if (route === '/api/v1/sync/people') {
       const dept = String(q.get('department') || '');
-      if (dept && dept !== 'gate') return jsonOut(res, { data: [] });
-      const people = Object.values(state.users)
+      if (dept && dept !== 'gate') return jsonOut(res, { data: [], total: 0 });
+      // three hundred names is a scroll, not a list, so this pages and searches
+      // like the screen that draws it does
+      const term = String(q.get('q') || q.get('search') || '').trim().toLowerCase();
+      let people = Object.values(state.users)
         .sort((a, b) => Number(a.pin) - Number(b.pin))
         .map((u) => ({
           connect_id: String(u.pin),
@@ -2088,8 +2091,22 @@ async function handleApi(req, res, route, q) {
           department_name: 'Face terminal',
           email: '',
           has_face: !!(u.bio && (u.bio.BIODATA || u.bio.FACE)),
+          has_photo: !!u.photo,
         }));
-      return jsonOut(res, { data: people, total: people.length });
+      if (term) {
+        people = people.filter((r) => r.connect_id.indexOf(term) >= 0
+          || r.employee_name.toLowerCase().indexOf(term) >= 0);
+      }
+      const total = people.length;
+      // no page asked for means the whole list, so an older caller is unaffected
+      const limit = Number(q.get('limit')) || 0;
+      const page = Math.max(1, Number(q.get('page')) || 1);
+      if (limit > 0) people = people.slice((page - 1) * limit, (page - 1) * limit + limit);
+      return jsonOut(res, {
+        data: people, total, page: limit > 0 ? page : 1, limit,
+        pages: limit > 0 ? Math.max(1, Math.ceil(total / limit)) : 1,
+        connected: Object.values(state.users).filter((u) => u.bio && (u.bio.BIODATA || u.bio.FACE)).length,
+      });
     }
 
     // The terminals record arrivals and departures, not what anyone worked on,
