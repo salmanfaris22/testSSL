@@ -213,7 +213,8 @@ const state = {
   marks: {},
   // allowIps: HR API allow-list, empty = denied. faceOnly: attendance counts
   // face-verified punches only. dwellSec: gate re-tap window, see below.
-  settings: { allowIps: [], faceOnly: undefined, dwellSec: undefined, doorPin: '' },
+  // hrKey: optional second lock on the HR/sync API, checked after the IP list
+  settings: { allowIps: [], faceOnly: undefined, dwellSec: undefined, doorPin: '', hrKey: '' },
 };
 const seen = new Set();          // dedupe key for punches
 const hrLog = [];                // recent HR API calls, newest last
@@ -1074,9 +1075,70 @@ function attendance(pin, from, to, face) {
 // request names the PINs it wants instead of dragging the whole terminal
 // across. No pin at all still means everyone, which is what the dashboard and
 // the CSV export ask for.
-function pinList(q) {
-  const raw = q && q.get ? String(q.get('pin') || '') : '';
+// The same list under two names: this server calls them PINs, the academy
+// calls them connect_ids, and they are the same numbers.
+function pinList(q, field) {
+  const raw = q && q.get ? String(q.get(field || 'pin') || '') : '';
   return [...new Set(raw.split(',').map((x) => normPin(x)).filter(Boolean))];
+}
+
+// A second lock behind the allow-list. The academy's client already sends
+// X-API-Key on every call, so this costs it nothing; with no key set here the
+// allow-list is still the only door, exactly as before.
+function keyOk(req) {
+  const want = String(state.settings.hrKey || '');
+  if (!want) return true;
+  const got = String(req.headers['x-api-key'] || req.headers['x-apikey'] || '');
+  return got === want;
+}
+
+// The day model flattened to one row per movement, in the shape the academy
+// stores: it keys events on {connect_id, session_uid, event_type, timestamp},
+// so session_uid is the day and the timestamp is the movement's own minute.
+// An Extra punch carries no event_type and is left out - it is shown on the
+// timeline here, never stored as attendance there.
+function syncEvents(pins, from, to, face) {
+  const out = [];
+  for (const pin of pins) {
+    const name = (state.users[pin] && cmdField(state.users[pin].name)) || '';
+    for (const date of dateRange(from, to)) {
+      const day = hrDay(pin, date, face);
+      if (!day) continue;
+      for (const step of day.steps) {
+        if (!step.event_type) continue;
+        out.push({
+          event_type: step.event_type,
+          timestamp: isoStamp(step.time),
+          connect_id: pin,
+          employee_name: name || day.name || '',
+          session_uid: pin + '|' + date,
+          session_date: date,
+          site_name: step.gate || '',
+          // the punch's own dedupe key, so a re-send lands on the same row
+          device_key: step.key,
+          taps: step.taps,
+          verified_by: step.verify_label,
+        });
+      }
+    }
+  }
+  // one ordering, so paging is stable between calls
+  return out.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1
+    : Number(a.connect_id) - Number(b.connect_id)));
+}
+
+// "2026-09-11 09:05:00" as local time, written with its offset so the far end
+// cannot read it as UTC and move everyone's day by five and a half hours.
+function isoStamp(local) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(String(local || ''));
+  if (!m) return '';
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+    Number(m[4]), Number(m[5]), Number(m[6]));
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const pad = (n) => String(Math.abs(n)).padStart(2, '0');
+  return m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + m[6]
+    + sign + pad(off / 60 | 0) + ':' + pad(off % 60);
 }
 
 const STEP_TYPE = {
@@ -1820,6 +1882,60 @@ function gradeImport(rows, pri) {
 }
 
 async function handleApi(req, res, route, q) {
+  // ---- The dialect the academy admin already speaks.
+  // Its sync engine was written against another HR server: it calls
+  // /api/v1/sync/health and /api/v1/sync/events with connect_id / start_date /
+  // end_date / page / limit and an X-API-Key header. Answering in that shape
+  // means the academy needs no new client - only its base URL repointed here.
+  if (route.startsWith('/api/v1/sync/')) {
+    const t0 = Date.now();
+    const asked = String(q.get('connect_id') || '');
+    if (!ipAllowed(req)) {
+      const why = (state.settings.allowIps || []).length
+        ? 'address not on the allow-list' : 'allow-list is empty, so nobody is admitted';
+      hrTrace(req, route, { pins: asked, ok: false, why, ms: Date.now() - t0 });
+      trace('err', '', 'sync API denied for ' + clientIp(req) + ' - ' + why);
+      return jsonOut(res, { error: 'forbidden', ip: clientIp(req) }, 403);
+    }
+    if (!keyOk(req)) {
+      hrTrace(req, route, { pins: asked, ok: false, why: 'wrong or missing API key',
+        ms: Date.now() - t0 });
+      return jsonOut(res, { error: 'unauthorized' }, 401);
+    }
+    res._hr = { req, route, pins: asked, t0 };
+
+    if (route === '/api/v1/sync/health') {
+      return jsonOut(res, { data: {
+        ok: true, service: 'aiface-mars', transport: 'rest+sse',
+        devices: Object.keys(state.devices).length,
+        online: Object.values(state.devices).filter((d) => d.online).length,
+      } });
+    }
+
+    if (route === '/api/v1/sync/events') {
+      // Empty means nobody here, not everybody. This feed exists to carry the
+      // people the academy has connected, and a caller that names none of them
+      // is asking for nothing - never for the whole roll.
+      const pins = pinList(q, 'connect_id');
+      if (!pins.length) {
+        return jsonOut(res, { data: { items: [], total: 0, page: 1, limit: 0,
+          note: 'name the people with connect_id - this feed never returns the whole roll' } });
+      }
+      const today = localDate(new Date());
+      const end = q.get('end_date') || today;
+      const start = q.get('start_date') || end;
+      const page = Math.max(1, Number(q.get('page')) || 1);
+      const limit = Math.min(Math.max(Number(q.get('limit')) || 200, 1), 1000);
+      const items = syncEvents(pins, start, end, faceOnly(q));
+      const from = (page - 1) * limit;
+      return jsonOut(res, { data: {
+        items: items.slice(from, from + limit),
+        total: items.length, page, limit,
+      } });
+    }
+    return jsonOut(res, { error: 'unknown endpoint' }, 404);
+  }
+
   // ---- HR read-only API, restricted to allow-listed IPs
   if (route.startsWith('/api/hr/')) {
     // the dashboard's own view of the door - local UI data about who knocked,
@@ -1976,6 +2092,7 @@ async function handleApi(req, res, route, q) {
       allowIps: state.settings.allowIps || [], yourIp: clientIp(req),
       faceOnly: faceSetting(), dwellSec: dwellSec(),
       doorPinSet: !!state.settings.doorPin,     // never echo the code itself
+      hrKeySet: !!state.settings.hrKey,         // nor the API key
     });
   }
   if (route === '/api/settings' && req.method === 'POST') {
@@ -1992,6 +2109,10 @@ async function handleApi(req, res, route, q) {
         + (ipRejected.length ? ' (rejected: ' + ipRejected.map((x) => x.rule).join(' ') + ')' : ''));
     }
     if (body.faceOnly !== undefined) state.settings.faceOnly = !!body.faceOnly;
+    if (body.hrKey !== undefined) {
+      state.settings.hrKey = String(body.hrKey).trim().slice(0, 128);
+      trace('info', '', 'HR API key ' + (state.settings.hrKey ? 'set' : 'cleared'));
+    }
     if (body.doorPin !== undefined) {
       state.settings.doorPin = String(body.doorPin).trim().slice(0, 32);
       trace('info', '', 'door code ' + (state.settings.doorPin ? 'set' : 'cleared'));
@@ -2004,7 +2125,7 @@ async function handleApi(req, res, route, q) {
     return jsonOut(res, {
       ok: true, allowIps: state.settings.allowIps, ipRejected,
       faceOnly: faceSetting(), dwellSec: dwellSec(),
-      doorPinSet: !!state.settings.doorPin,
+      doorPinSet: !!state.settings.doorPin, hrKeySet: !!state.settings.hrKey,
     });
   }
   // The picture itself. Served from disk rather than through the state payload
@@ -2971,6 +3092,12 @@ h1{font-size:15px}
       </div>
       <div id="ipRules" class="row" style="margin-top:10px"></div>
       <div id="ipMsg" class="note" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:12px">
+        <input id="hrKey" placeholder="API key (optional second lock)" style="flex:1;min-width:220px">
+        <button class="p" onclick="saveHrKey()">Save key</button>
+        <button onclick="clearHrKey()">Clear</button>
+      </div>
+      <div id="hrKeyMsg" class="note" style="margin-top:8px"></div>
       <div class="note" style="margin-top:12px">
         <b>Endpoints</b> &mdash; share these with HR:<br>
         <span class="mono" id="hrUrls"></span><br>
@@ -4498,6 +4625,21 @@ function loadStats(){
 
 // The door's log. Local UI data about who knocked, so it is not itself behind
 // the door it describes.
+function saveHrKey(){
+  var v = q('hrKey').value.trim();
+  if (!v) return q('hrKeyMsg').textContent = 'type a key first, or press Clear to remove it';
+  fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ hrKey: v }) })
+    .then(function(){ q('hrKey').value = ''; loadIps(); });
+}
+
+function clearHrKey(){
+  if (!confirm('Remove the API key? The allow-list becomes the only lock on this API.')) return;
+  fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ hrKey: '' }) })
+    .then(function(){ q('hrKey').value = ''; loadIps(); });
+}
+
 function loadHrLog(){
   fetch('/api/hr/log').then(function(r){ return r.json(); }).then(function(j){
     var callers = j.callers || [], calls = j.calls || [];
@@ -4551,6 +4693,11 @@ function loadIps(){
     drawIps();
     q('myIp').textContent = c.yourIp || '?';
     q('doorPin').placeholder = c.doorPinSet ? 'code set - type a new one to change' : 'door code (blank = no code)';
+    q('hrKey').placeholder = c.hrKeySet
+      ? 'key set - type a new one to change' : 'API key (optional second lock)';
+    q('hrKeyMsg').innerHTML = c.hrKeySet
+      ? '<span style="color:var(--ok)">A key is required as well as an allowed address.</span>'
+      : '<span class="hint">No key set &mdash; the allow-list is the only lock.</span>';
     q('doorPinMsg').innerHTML = c.doorPinSet
       ? '<span style="color:var(--ok)">/opendoor asks for a code.</span>'
       : '<span style="color:var(--warn)">/opendoor is open to anyone on this network.</span>';
@@ -4566,7 +4713,11 @@ function loadIps(){
       base + '/api/hr/punches?pin=2,5,9&from=' + day + '&to=' + end,
       base + '/api/hr/users',
       base + '/api/hr/devices',
-      'POST ' + base + '/api/hr/fetch?days=7'
+      'POST ' + base + '/api/hr/fetch?days=7',
+      '',
+      'For the academy admin (set this as its base URL):',
+      base + '/api/v1/sync/health',
+      base + '/api/v1/sync/events?connect_id=1,2,3&start_date=' + day + '&end_date=' + end
     ].map(esc).join('<br>');
     q('ipMsg').innerHTML = (c.allowIps || []).length
       ? '<span style="color:var(--ok)">Allow-list active for ' + c.allowIps.length + ' rule(s).</span>'
