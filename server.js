@@ -1359,11 +1359,19 @@ function serverStats(days) {
       online: Object.values(state.devices).filter((x) => x.online).length,
     },
     series, hours, days: span, today,
-    devices: Object.values(state.devices).map((x) => ({
-      sn: x.sn, online: !!x.online, role: x.role || '',
-      lastSeen: x.lastSeen, clockOffset: x.clockOffset || 0,
-      punches: byDevice[x.sn] || 0,
-    })).sort((a, b) => b.punches - a.punches),
+    devices: Object.values(state.devices).map((x) => {
+      const i = x.info || {};
+      return {
+        sn: x.sn, online: !!x.online, role: x.role || '',
+        lastSeen: x.lastSeen, clockOffset: x.clockOffset || 0,
+        punches: byDevice[x.sn] || 0,
+        // what the terminal itself holds, so the server view can show the
+        // same face coverage the device card does
+        faces: Number(i.FaceCount || i.face_count || 0),
+        users: Number(i.UserCount || i.user_count || 0),
+        maxFaces: Number(i.MaxFaceCount || 0),
+      };
+    }).sort((a, b) => b.punches - a.punches),
     proc: {
       uptime: Math.round(process.uptime()),
       rss: mem.rss, heapUsed: mem.heapUsed,
@@ -2183,6 +2191,7 @@ h1{font-size:16px;margin:0;letter-spacing:.3px}
 .card.sm .k{text-transform:none;letter-spacing:0;font-size:11.5px;
 font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis}
 .card.sm .v{font-size:16px;margin-top:3px}
+.card.sm .sub{font-size:11px;color:var(--dim);margin-top:2px}
 .grid.tight{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
 /* how much of the roll the terminal can actually recognise */
 .meter{height:8px;border-radius:6px;background:#0d1117;border:1px solid var(--line);overflow:hidden}
@@ -2454,7 +2463,8 @@ h1{font-size:15px}
     </div>
     <div class="body note syncMsg" style="padding-top:0"></div>
     <div class="scroll" style="max-height:620px">
-      <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th></tr></thead>
+      <table><thead><tr><th>Time</th><th>PIN</th><th>Name</th><th>Type</th><th>Verified by</th><th>Device</th>
+      <th></th></tr></thead>
       <tbody id="tbLogs"></tbody></table>
       <div class="empty" id="emptyLogs">Waiting for the first punch from the device...</div>
     </div>
@@ -2582,19 +2592,6 @@ h1{font-size:15px}
           </span>
         </h2>
         <div class="body">
-          <p class="hint" style="margin:0 0 9px">Paste the roll as it comes &mdash; one person per line,
-          number first, then the name. A tab, a comma or a run of spaces all count as the column break,
-          and a heading row is ignored. <b>Preview</b> shows what was understood and changes nothing;
-          <b>Push</b> then sends the records to every online terminal in a single go. The selector
-          above chooses which ones go: all of them, only the <b>new</b> names, only the ones whose
-          details <b>changed</b>, or only the <b>unchanged</b> ones &mdash; which is how a terminal
-          that was wiped gets its names back from the records this server still holds.
-          <b>Dupes</b> is the same roll filtered to the people who are already on file under a
-          second number &mdash; the paste is matched on the name, ignoring case and punctuation,
-          against both the other lines and every record here. With <b>CAPS</b> ticked each name is
-          stored in capitals, so a roll typed in mixed case still reads the same on the terminal;
-          names already on file in small letters are raised from
-          <b>Users on device</b> under the Log tab.</p>
           <textarea id="bText" rows="7" spellcheck="false"
             placeholder="No.&#9;Student Name&#10;5001&#9;HASHIM SHAHAL K&#10;5002&#9;MUHAMMED JASIM&#10;5003&#9;MUHAMMED HIZAM"></textarea>
           <div class="row" style="margin-top:9px">
@@ -2608,9 +2605,6 @@ h1{font-size:15px}
             <table><thead><tr><th>Line</th><th>PIN</th><th>Name</th><th>Card</th><th>Status</th></tr></thead>
             <tbody id="bRows"></tbody></table>
           </div>
-          <p class="hint" style="margin:10px 0 0">The face template still has to be enrolled at the
-          terminal. This creates the user records so the faces have something to be registered against
-          &mdash; at the terminal each of these numbers will already carry its name.</p>
         </div>
       </div>
       <div class="panel">
@@ -2939,7 +2933,9 @@ function loadDupes(then){
     .then(function(j){
       if (!j || !j.ok) { userNote('could not read the duplicates'); return; }
       DUPES = {};
-      j.groups.forEach(function(g){
+      // a reply that is ok but shaped wrong would throw here, and one thrown
+      // error in this file stops the whole dashboard drawing
+      (j.groups || []).forEach(function(g){
         DUPES[g.keep.pin] = {role:'keep', why:g.keep.why, holds:[], group:g.keep.pin,
           twin:g.drop.map(function(d){ return d.pin; }).join(', ')};
         g.drop.forEach(function(d){
@@ -3198,6 +3194,12 @@ function render(s){
       // gap between the two counts is the part of the roll that cannot get in
       var pct = users ? Math.round(faces / users * 100) : 0;
       var tone = pct >= 90 ? '' : pct >= 60 ? 'warn' : 'bad';
+      var maxFace = cap(faces, i.MaxFaceCount);
+      // the multi-bio table keeps its own face figure and the two disagree on
+      // this firmware; one number goes on screen, the other stays reachable
+      var bioFace = Number((String(i.MaxMultiBioDataCount || '').split(':'))[8] || 0);
+      var faceTip = maxFace && bioFace && bioFace !== maxFace
+        ? 'MaxFaceCount ' + num(maxFace) + ', multi-bio face slot ' + num(bioFace) : '';
       return '<div class="devcard">'
         + '<div class="row" style="justify-content:space-between"><b class="mono">' + esc(d.sn) + '</b>'
         + '<span class="row"><span class="badge ' + (d.online?'on':'off') + '">'
@@ -3205,15 +3207,21 @@ function render(s){
         + '<button onclick="cmd(&quot;info&quot;,' + esc(JSON.stringify({sn:d.sn})) + ')">Refresh info</button>'
         + '</span></div>'
         + '<div class="grid tight" style="margin:10px 0">'
-        + card('sm', 'Faces', num(faces)) + card('sm', 'Users', num(users))
-        + card('sm', 'Logs', num(logs))
+        + card('sm', 'Faces', num(faces), maxFace ? 'of ' + num(maxFace) : '', faceTip)
+        + card('sm', 'Users', num(users), cap(users, i.MaxUserCount) ? 'of ' + num(cap(users, i.MaxUserCount)) : '')
+        + card('sm', 'Logs', num(logs), cap(logs, i.MaxAttLogCount) ? 'of ' + num(cap(logs, i.MaxAttLogCount)) : '')
         + '</div>'
         + (users
-            ? '<div class="hint" style="margin-bottom:5px">Faces enrolled &mdash; <b>' + num(faces)
-              + '</b> of <b>' + num(users) + '</b> (' + pct + '%)'
-              + (faces < users ? ' &middot; ' + num(users - faces) + ' cannot be recognised yet' : '')
-              + '</div><div class="meter"><i class="' + tone + '" style="width:'
+            ? '<div class="hint" style="margin-bottom:5px"><b>'
+              + (faces >= users ? 'Everyone has a face'
+                  : users - faces === 1 ? '1 person still needs a face'
+                    : num(users - faces) + ' people still need a face')
+              + '</b></div><div class="meter"><i class="' + tone + '" style="width:'
               + Math.min(pct, 100) + '%"></i></div>'
+              + '<div class="hint" style="margin-top:5px">' + num(faces) + ' of ' + num(users)
+              + ' people done'
+              + (maxFace ? ' &middot; this terminal holds ' + num(maxFace) + ' faces' : '')
+              + '</div>'
             : '')
         + '<div class="hint" style="margin-top:10px">'
         + 'IP <b>' + esc(d.ip||'?') + '</b><br>'
@@ -3238,6 +3246,12 @@ function render(s){
   }
 
   // logs
+  // who has a portrait on file, read from this frame's users rather than from
+  // PEOPLE, which is only assigned further down
+  var hasPic = {};
+  for (var pi = 0; pi < s.users.length; pi++) {
+    if (s.users[pi].photo) hasPic[String(s.users[pi].pin)] = 1;
+  }
   var tb = '';
   for (var i = 0; i < s.logs.length; i++) {
     var r = s.logs[i];
@@ -3251,7 +3265,11 @@ function render(s){
        + '<td><span class="pill ' + cls + '">' + esc(st) + '</span>'
        + (r.taps > 1 ? ' <span class="tag">' + r.taps + ' taps</span>' : '') + '</td>'
        + '<td>' + esc(LAB.verify[r.verify] || ('Mode ' + r.verify)) + '</td>'
-       + '<td class="mono" style="color:#8b949e">' + esc(r.sn) + '</td></tr>';
+       + '<td class="mono" style="color:#8b949e">' + esc(r.sn) + '</td>'
+       + '<td style="text-align:right">'
+       + (hasPic[String(r.pin)]
+           ? '<button class="vw" onclick="viewPhoto(\\'' + esc(r.pin) + '\\')">View</button>' : '')
+       + '</td></tr>';
   }
   q('tbLogs').innerHTML = tb;
   q('emptyLogs').style.display = s.logs.length ? 'none' : 'block';
@@ -3790,9 +3808,21 @@ function renderAtt(a){
     + (t.ignored ? ' <b>' + t.ignored + '</b> card or fingerprint punch(es) in this range were not counted.' : '');
 }
 // the same card at a smaller size, for a fact that reads as a word
-function card(cls, k, v){
-  return '<div class="card ' + cls + '"><div class="k" title="' + esc(String(k)) + '">'
-    + esc(String(k)) + '</div><div class="v">' + v + '</div></div>';
+function card(cls, k, v, sub, title){
+  return '<div class="card ' + cls + '"' + (title ? ' title="' + esc(String(title)) + '"' : '')
+    + '><div class="k" title="' + esc(String(k)) + '">'
+    + esc(String(k)) + '</div><div class="v">' + v + '</div>'
+    + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div>';
+}
+
+// A maximum below the count it is supposed to cap is not a maximum. This
+// firmware reports MaxAttLogCount=20 against thousands of stored punches and
+// MaxUserCount=100 against nearly three hundred users, so a ceiling is shown
+// only where it could actually be true - everywhere else, nothing is shown
+// rather than a number that would have to be explained away.
+function cap(current, max){
+  var m = Number(max) || 0;
+  return m > 0 && m >= (Number(current) || 0) ? m : 0;
 }
 
 function kpi(k, v, col){
@@ -4056,12 +4086,18 @@ function loadStats(){
       + bars(t.hours, function(p){ return p.date + ':00'; }, 'punches') + '</div>'
       + '<div class="hint" style="margin:14px 0 6px">Terminals</div>'
       + '<div class="scroll"><table><thead><tr><th>Serial</th><th>State</th><th>Gate</th>'
+      + '<th>Faces</th><th>Users</th>'
       + '<th>Clock</th><th>Punches</th><th>Last contact</th></tr></thead><tbody>'
       + t.devices.map(function(d){
           return '<tr><td class="mono">' + esc(d.sn) + '</td>'
             + '<td><span class="badge ' + (d.online?'on':'off') + '">'
             + (d.online?'online':'offline') + '</span></td>'
             + '<td>' + (d.role === 'in' ? 'Check-in' : d.role === 'out' ? 'Check-out' : '&mdash;') + '</td>'
+            + '<td class="mono">' + num(d.faces)
+            + (cap(d.faces, d.maxFaces)
+                ? ' <span class="hint">/ ' + num(cap(d.faces, d.maxFaces)) + '</span>' : '')
+            + '</td>'
+            + '<td class="mono">' + num(d.users) + '</td>'
             + '<td>' + (d.clockOffset
                 ? Math.abs(d.clockOffset) + ' min ' + (d.clockOffset > 0 ? 'behind' : 'ahead')
                 : 'in step') + '</td>'
