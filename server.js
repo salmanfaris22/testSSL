@@ -23,7 +23,9 @@ const path = require('path');
 const zlib = require('zlib');
 
 const PORT = Number(process.env.PORT || 8080);
-const DATA_DIR = path.join(__dirname, 'data');
+// Tests and isolated deployments can point at their own copy without ever
+// touching the live terminal history.  Production keeps the bundled data dir.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const ATT_FILE = path.join(DATA_DIR, 'attlog.jsonl');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 // One file per person rather than a field on the record: users.json is
@@ -568,21 +570,69 @@ function hookDone(hook, event, body, attempt, okish, status, ms, error) {
   hookQueue.push(timer);
 }
 
-// What a receiver is told when somebody walks through the door.
+// What a receiver is told when somebody walks through the door.  The raw
+// punch is retained for auditing, but it is not enough for HR or Academy to
+// decide whether a person started work, started a break, returned, or left.
+// Include the freshly-derived day as well.  A receiver upserts `steps` by its
+// `key` and replaces the day snapshot on every delivery; that matters because
+// a later punch can turn a prior "Break start" into the day's "Check out".
 function hookBody(rec) {
   const date = dayOf(rec.time);
+  const key = punchKey(rec);
+  const day = hrDay(rec.pin, date, faceSetting());
+  const step = day && day.steps.find((row) => row.key === key
+    || row.rows.some((tap) => tap.key === key));
   return {
+    contract: 'attendance-day/v1',
     pin: rec.pin,
     name: rec.name || (state.users[rec.pin] && cmdField(state.users[rec.pin].name)) || '',
     time: isoStamp(rec.time),
     local_time: rec.time,
     session_date: date,
     session_uid: rec.pin + '|' + date,
-    device_key: punchKey(rec),
+    device_key: key,
     gate: rec.sn,
     direction: dirOf(rec),
     verify: rec.verify,
     verified_by: VERIFY[rec.verify] || ('mode ' + rec.verify),
+    // `movement` is the labelled row containing this tap.  `attendance` is
+    // the complete current timeline, ready to render as Step / Time / Gate /
+    // Taps without either receiving app re-implementing attendance rules.
+    movement: step || null,
+    attendance: day,
+  };
+}
+
+function hookTestBody() {
+  const date = localDate(new Date());
+  const at = (time) => date + ' ' + time + ':00';
+  const sample = [
+    ['Check in', '09:17', 'In ZHM2255300881', 1, ''],
+    ['Break start', '13:16', 'Out ZHM2255300866', 2, '11:31 AM'],
+    ['Break end', '13:51', 'In ZHM2255300881', 1, ''],
+    ['Check out', '17:45', 'Out ZHM2255300866', 2, '5:44 PM'],
+  ].map((row, i) => ({
+    step: row[0], event_type: STEP_TYPE[row[0]], time: at(row[1]),
+    time_label: ampmOf(at(row[1])), gate: row[2], taps: row[3],
+    first_time: row[4] ? '' : at(row[1]),
+    taps_label: row[3] + (row[3] === 1 ? ' tap' : ' taps')
+      + (row[4] ? ', first ' + row[4] : ''),
+    key: 'test|' + (i + 1), rows: [],
+  }));
+  return {
+    contract: 'attendance-day/v1', pin: 'test', name: 'Webhook test user',
+    time: isoStamp(at('17:45')), local_time: at('17:45'), session_date: date,
+    session_uid: 'test|' + date, device_key: 'test|4', gate: 'ZHM2255300866',
+    direction: 'out', verify: 15, verified_by: 'Face',
+    movement: sample[3],
+    attendance: {
+      pin: 'test', name: 'Webhook test user', date, status: 'Present',
+      check_in: at('09:17'), check_out: at('17:45'), check_in_label: '9:17 AM',
+      check_out_label: '5:45 PM', pending: false, pending_note: '', incomplete: false,
+      total_minutes: 508, break_minutes: 35, work_minutes: 473,
+      movements: 4, taps: 6, ignored: 0, breaks: [{ from: at('13:16'), to: at('13:51'), min: 35 }],
+      steps: sample,
+    },
   };
 }
 
@@ -2524,10 +2574,7 @@ async function handleApi(req, res, route, q) {
     try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
     const hook = hookById(p.id);
     if (!hook) return jsonOut(res, { ok: false, error: 'no such webhook' }, 404);
-    hookSend(hook, 'attendance.test', {
-      pin: 'test', name: 'Test delivery', time: new Date().toISOString(),
-      note: 'This is a test from the attendance server. Nobody walked through a door.',
-    }, 0);
+    hookSend(hook, 'attendance.test', hookTestBody(), 0);
     return jsonOut(res, { ok: true, note: 'sent - watch the log below for the answer' });
   }
 
@@ -3569,11 +3616,11 @@ h1{font-size:15px}
   </div>
 
   <div class="panel">
-    <h2>Webhooks
+    <h2>Webhook connections
       <span class="row">
         <span class="seg" id="whTabs">
           <button class="on" id="whTabSet" onclick="whTab('set')">Webhooks</button>
-          <button id="whTabLog" onclick="whTab('log')">Delivery log</button>
+          <button id="whTabLog" onclick="whTab('log')">Webhook logs</button>
         </span>
         <button onclick="loadHooks()">Refresh</button>
       </span>
@@ -3581,10 +3628,12 @@ h1{font-size:15px}
     <div class="body">
       <div id="whSet">
         <div class="note" style="margin-bottom:10px">A webhook is pushed the moment somebody
-        walks through the door &mdash; no one has to ask for it. Each one carries its own range
-        of numbers, so a receiver is only ever sent the people it is meant to see; the range is
-        applied here, which is the only place that sees every punch. Create the webhook in HR or
-        the academy, paste its link and key below, and press <b>Test</b> before trusting it.</div>
+        walks through the door &mdash; no one has to ask for it. You may connect HR, Academy,
+        and other receivers at the same time. Each connection only receives the people in its
+        selected range (leave both fields as <b>any</b> for everyone). Every delivery includes the
+        current attendance timeline: <b>Check in, Break start, Break end, Check out</b>, with its
+        time, gate, and folded tap count. Create the webhook in HR or Academy, paste its link and
+        key below, and press <b>Test</b> before trusting it.</div>
         <div class="row" style="align-items:flex-end">
           <label class="hint" style="flex:2;min-width:150px">Name<br>
             <input id="whName" placeholder="HR live attendance" style="margin-top:4px"></label>
@@ -3611,8 +3660,8 @@ h1{font-size:15px}
       <div id="whLog" style="display:none">
         <div class="note" id="whLogSum" style="margin-bottom:10px"></div>
         <div class="scroll" style="max-height:420px">
-          <table><thead><tr><th>Time</th><th>Webhook</th><th>Event</th><th>PIN</th>
-          <th>Result</th><th>Took</th></tr></thead><tbody id="whLogRows"></tbody></table>
+          <table><thead><tr><th>Time</th><th>Webhook</th><th>Event</th><th>Person</th>
+          <th>Result / error</th><th>Took</th></tr></thead><tbody id="whLogRows"></tbody></table>
           <div class="empty" id="whLogNone">Nothing has been delivered yet.</div>
         </div>
       </div>
