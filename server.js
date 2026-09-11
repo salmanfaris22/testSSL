@@ -1343,9 +1343,31 @@ function splitRow(line) {
   return i < 0 ? [line] : [line.slice(0, i), line.slice(i + 1)];
 }
 
-function parseUserList(text) {
+// Two records for one human. A name is what a person is recognised by, and
+// case, punctuation and double spaces all vary between one roll and the next,
+// so none of them are allowed to hide a match.
+function nameKey(n) {
+  return cmdField(n).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+}
+
+// A duplicate is a flag, not a status: the line is still perfectly usable on
+// its own, so it keeps whatever new/changed/unchanged it earned and carries
+// the other PIN alongside for the operator to judge.
+function markDup(row, pin) {
+  row.dup = true;
+  row.dupOf = row.dupOf || [];
+  if (pin && row.dupOf.indexOf(pin) < 0) row.dupOf.push(pin);
+}
+
+function hasLower(name) {
+  const n = cmdField(name);
+  return !!n && n !== n.toUpperCase();
+}
+
+function parseUserList(text, upper) {
   const rows = [];
   const at = new Map();               // pin -> row index, so a repeat can void the first
+  const byName = new Map();           // name key -> row indexes, so one person twice shows
   const lines = String(text || '').split(/\r?\n/);
   let over = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -1364,6 +1386,9 @@ function parseUserList(text) {
       name = f.slice(1, -1).join(' ');
     }
     row.name = cmdField(name);
+    // every name is stored in capitals, so a roll typed in mixed case reads
+    // the same on the terminal as one typed in shouting
+    if (upper) row.name = row.name.toUpperCase();
     row.card = card;
     if (!/^\d/.test(f[0] || '') && HEADER_RE.test(f[0] || '')) {
       row.pin = f[0];
@@ -1386,6 +1411,17 @@ function parseUserList(text) {
         rows[prev].note = 'PIN repeats on line ' + (i + 1) + ', which wins';
       }
       at.set(row.pin, rows.length);
+      const key = nameKey(row.name);
+      if (key) {
+        const twins = byName.get(key) || [];
+        for (const t of twins) {
+          if (rows[t].pin === row.pin) continue;   // same PIN twice is a repeat, not a twin
+          markDup(rows[t], row.pin);
+          markDup(row, rows[t].pin);
+        }
+        twins.push(rows.length);
+        byName.set(key, twins);
+      }
     }
     rows.push(row);
   }
@@ -1401,9 +1437,19 @@ const PICK = {
   new: ['new'],
   update: ['update'],
   same: ['same'],
+  dup: ['new', 'update', 'same'],
 };
 
-const PICK_WORD = { all: 'usable', new: 'new', update: 'changed', same: 'unchanged' };
+// "dup" is not a status of its own - it is every usable row that names a
+// person already on file under another number, which is the slice an operator
+// wants to look at before anything goes out.
+const inPick = (r, pick) => (pick === 'dup'
+  ? !!r.dup && PICK.all.includes(r.status)
+  : PICK[pick].includes(r.status));
+
+const PICK_WORD = {
+  all: 'usable', new: 'new', update: 'changed', same: 'unchanged', dup: 'a duplicate name',
+};
 
 const PRI_LABEL = { 0: 'User', 2: 'Enroller', 6: 'Manager', 14: 'Super admin' };
 
@@ -1412,8 +1458,22 @@ const PRI_LABEL = { 0: 'User', 2: 'Enroller', 6: 'Manager', 14: 'Super admin' };
 // says which field moves, because a class roll pasted at the User role would
 // otherwise demote a super admin whose PIN happens to collide, silently.
 function gradeImport(rows, pri) {
+  // The paste only ever shows one half of a duplicate: the person already on
+  // file under a second number is in the records, not in the text, so the
+  // records are what the names are matched against.
+  const held = new Map();
+  for (const u of Object.values(state.users)) {
+    const k = nameKey(u.name);
+    if (!k) continue;
+    if (!held.has(k)) held.set(k, []);
+    held.get(k).push(String(u.pin));
+  }
   for (const r of rows) {
-    if (r.status === 'error' || r.status === 'header' || r.status === 'dupe') continue;
+    if (r.status === 'error' || r.status === 'header') continue;
+    for (const pin of held.get(nameKey(r.name)) || []) {
+      if (pin !== r.pin) markDup(r, pin);
+    }
+    if (r.status === 'dupe') continue;
     const u = state.users[r.pin];
     if (!u) { r.status = 'new'; continue; }
     const was = [];
@@ -1426,10 +1486,19 @@ function gradeImport(rows, pri) {
     r.status = was.length ? 'update' : 'same';
     r.note = [r.note, was.join(', ')].filter(Boolean).join(' - ');
   }
+  for (const r of rows) {
+    if (!r.dup) continue;
+    r.note = [r.note, 'same name already on PIN ' + r.dupOf.join(', ')]
+      .filter(Boolean).join(' - ');
+  }
   const count = (k) => rows.filter((r) => r.status === k).length;
   return {
     lines: rows.length, new: count('new'), update: count('update'), same: count('same'),
     dupe: count('dupe'), header: count('header'), error: count('error'),
+    // what the duplicate view would send, so the button and the chip agree
+    dup: rows.filter((r) => inPick(r, 'dup')).length,
+    // every twin found, including the ones no pick can send
+    dupAll: rows.filter((r) => r.dup).length,
   };
 }
 
@@ -1726,13 +1795,16 @@ async function handleApi(req, res, route, q) {
     let p = {};
     try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
     const pri = String(Number(p.pri) || 0);
-    const parsed = parseUserList(p.text);
+    const upper = p.upper !== false;
+    const parsed = parseUserList(p.text, upper);
     const counts = gradeImport(parsed.rows, pri);
     const pick = PICK[p.pick] ? p.pick : 'all';
-    const wanted = parsed.rows.filter((r) => PICK[pick].includes(r.status));
+    const wanted = parsed.rows.filter((r) => inPick(r, pick));
     counts.push = wanted.length;
     counts.pick = pick;
-    const preview = { ok: true, dryRun: true, counts, rows: parsed.rows, over: parsed.over };
+    const preview = {
+      ok: true, dryRun: true, upper, counts, rows: parsed.rows, over: parsed.over,
+    };
     if (p.dryRun) return jsonOut(res, preview);
 
     if (!wanted.length) {
@@ -1788,6 +1860,59 @@ async function handleApi(req, res, route, q) {
       returned: done.length, failed: bad.length,
       failures: bad.slice(0, 20).map((c) => ({ sn: c.sn, pin: c.pin || '', result: c.result })),
     });
+  }
+
+  // Names stored in mixed case. They came in that way from an older paste or
+  // from the terminal's own keypad, and they are the ones that read wrong next
+  // to a roll typed in capitals. dryRun lists them and changes nothing; the
+  // apply rewrites the name only - privilege and card are carried through
+  // untouched, so raising a name's case can never quietly demote anyone.
+  if (route === '/api/users/case' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    const only = Array.isArray(p.pins) && p.pins.length
+      ? new Set(p.pins.map((x) => normPin(x))) : null;
+    const found = Object.values(state.users)
+      .filter((u) => hasLower(u.name))
+      .filter((u) => !only || only.has(String(u.pin)))
+      .sort((a, b) => Number(a.pin) - Number(b.pin))
+      .map((u) => ({ pin: String(u.pin), name: cmdField(u.name),
+        upper: cmdField(u.name).toUpperCase() }));
+    const preview = { ok: true, dryRun: true, total: found.length, rows: found };
+    if (p.dryRun) return jsonOut(res, preview);
+    if (!found.length) {
+      return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
+        error: 'every stored name is already in capitals' }), 400);
+    }
+    const all = Object.keys(state.devices);
+    const online = all.filter((sn) => state.devices[sn].online);
+    const targets = p.sn ? [p.sn] : online;
+    if (!targets.length) {
+      return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
+        error: 'no terminal is online right now - ' + all.length
+          + ' known device(s), none polling this server' }), 409);
+    }
+    const batch = ++importSeq;
+    const queued = [];
+    for (const r of found) {
+      const u = state.users[r.pin];
+      if (!u) continue;
+      u.name = r.upper;
+      u.updated = Date.now();
+      const pri = String(u.privilege || '0');
+      for (const sn of targets) {
+        queued.push(enqueue(sn, buildCommand('adduser',
+          { pin: r.pin, name: r.upper, card: u.card || '', pri }),
+        { kind: 'adduser', batch, pin: r.pin }));
+      }
+    }
+    saveSoon();
+    trace('info', '', 'case fix: ' + found.length + ' name(s) raised to capitals -> '
+      + targets.length + ' terminal(s), batch ' + batch);
+    return jsonOut(res, Object.assign({}, preview, {
+      dryRun: false, batch, targets,
+      queued: queued.map((c) => ({ id: c.id, sn: c.sn, pin: c.pin })),
+    }));
   }
 
   if (route === '/api/role' && req.method === 'POST') {
@@ -1879,6 +2004,8 @@ padding:7px 12px;font-size:12px;cursor:pointer;font-family:inherit}
 button:hover{border-color:var(--accent);color:#fff}
 button.p{background:var(--accent);border-color:var(--accent);color:#fff}
 button.d{border-color:rgba(239,68,68,.4);color:#f87171}
+/* a standalone button that is holding a filter open, outside a .seg group */
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
 button:disabled,button.p:disabled{background:#21262d;border-color:var(--line);color:var(--dim);
 cursor:default;opacity:.65}
 input,select,textarea{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:7px;
@@ -1917,6 +2044,8 @@ color:var(--dim);white-space:nowrap}
 .st.update{background:rgba(59,130,246,.16);color:#93c5fd;border-color:rgba(59,130,246,.4)}
 .st.dupe,.st.header{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
 .st.error{background:rgba(239,68,68,.12);color:#f87171;border-color:rgba(239,68,68,.3)}
+.st.dup{background:rgba(168,85,247,.16);color:#d8b4fe;border-color:rgba(168,85,247,.42)}
+.st.low{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
 /* a row the current pick would not send - still listed, visibly not going */
 #bRows tr.skip{opacity:.38}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
@@ -2110,9 +2239,12 @@ h1{font-size:15px}
     <h2>Users on device
       <span class="row">
         <input id="uq" placeholder="Filter users" style="width:170px" oninput="renderUsers()">
+        <button id="uLow" onclick="toggleLower()">small letters</button>
+        <button class="p" id="uFix" onclick="fixCase()">UPPERCASE</button>
         <button onclick="cmd('queryuser')">Pull from device</button>
       </span>
     </h2>
+    <div class="note" id="uMsg" style="padding:0 14px 8px"></div>
     <div class="scroll" style="max-height:300px">
       <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
       <tbody id="tbUsers"></tbody></table>
@@ -2202,11 +2334,16 @@ h1{font-size:15px}
               <option value="0">User</option><option value="2">Enroller</option>
               <option value="6">Manager</option><option value="14">Super admin</option>
             </select>
+            <label class="hint" style="display:flex;align-items:center;gap:5px"
+              title="Store every name in capital letters">
+              <input id="bUpper" type="checkbox" checked style="width:auto" onchange="bulkRegrade()">CAPS
+            </label>
             <span class="seg" id="bPick">
               <button class="on" onclick="setPick('all')" id="pkall">All</button>
               <button onclick="setPick('new')" id="pknew">New</button>
               <button onclick="setPick('update')" id="pkupdate">Changed</button>
               <button onclick="setPick('same')" id="pksame">Unchanged</button>
+              <button onclick="setPick('dup')" id="pkdup">Dupes</button>
             </span>
           </span>
         </h2>
@@ -2217,7 +2354,13 @@ h1{font-size:15px}
           <b>Push</b> then sends the records to every online terminal in a single go. The selector
           above chooses which ones go: all of them, only the <b>new</b> names, only the ones whose
           details <b>changed</b>, or only the <b>unchanged</b> ones &mdash; which is how a terminal
-          that was wiped gets its names back from the records this server still holds.</p>
+          that was wiped gets its names back from the records this server still holds.
+          <b>Dupes</b> is the same roll filtered to the people who are already on file under a
+          second number &mdash; the paste is matched on the name, ignoring case and punctuation,
+          against both the other lines and every record here. With <b>CAPS</b> ticked each name is
+          stored in capitals, so a roll typed in mixed case still reads the same on the terminal;
+          names already on file in small letters are raised from
+          <b>Users on device</b> under the Log tab.</p>
           <textarea id="bText" rows="7" spellcheck="false"
             placeholder="No.&#9;Student Name&#10;5001&#9;HASHIM SHAHAL K&#10;5002&#9;MUHAMMED JASIM&#10;5003&#9;MUHAMMED HIZAM"></textarea>
           <div class="row" style="margin-top:9px">
@@ -2538,25 +2681,89 @@ var PRIVILEGE = {'0':'User','2':'Enroller','6':'Manager','14':'Super admin'};
 
 // Drawn from PEOPLE rather than from the response, so typing in the filter
 // redraws the list without waiting for the next poll.
-function renderUsers(){
+// A name is "small letters" when raising it would change it - that catches
+// "Joel Mathews" and "MOHAMMED mufeed" alike, and leaves a name that is
+// already shouting, or has no letters at all, alone.
+function isLower(name){
+  var n = String(name || '').trim();
+  return !!n && n !== n.toUpperCase();
+}
+
+var LOWONLY = false, CASE_TIMER = null;
+
+function toggleLower(){
+  LOWONLY = !LOWONLY;
+  q('uLow').className = LOWONLY ? 'on' : '';
+  renderUsers();
+}
+
+function userNote(msg){ q('uMsg').textContent = msg; }
+
+// What the UPPERCASE button would act on: whatever is listed right now, so
+// both the text filter and the small-letters toggle narrow it.
+function lowerShown(){
+  return visibleUsers().filter(function(u){ return isLower(u.name); });
+}
+
+function visibleUsers(){
   var term = (q('uq').value || '').toLowerCase();
   var list = PEOPLE || [];
   if (term) list = list.filter(function(u){
     return String(u.pin).toLowerCase().indexOf(term) >= 0
       || String(u.name || '').toLowerCase().indexOf(term) >= 0;
   });
+  if (LOWONLY) list = list.filter(function(u){ return isLower(u.name); });
+  return list;
+}
+
+function renderUsers(){
+  var list = visibleUsers();
   q('tbUsers').innerHTML = list.map(function(u){
     var bio = u.bio ? Object.keys(u.bio).join(', ') : '';
-    return '<tr><td class="mono">' + esc(u.pin) + '</td><td>' + esc(u.name) + '</td>'
+    return '<tr><td class="mono">' + esc(u.pin) + '</td><td>' + esc(u.name)
+      + (isLower(u.name) ? ' <span class="st low">small letters</span>' : '') + '</td>'
       + '<td class="mono">' + esc(u.card || '') + '</td>'
       + '<td>' + esc(PRIVILEGE[u.privilege] || u.privilege || 'User') + '</td>'
       + '<td style="color:#8b949e">' + esc(bio) + '</td></tr>';
   }).join('');
+  var low = (PEOPLE || []).filter(function(u){ return isLower(u.name); }).length;
+  q('uLow').textContent = 'small letters' + (low ? ' ' + low : '');
+  q('uLow').className = LOWONLY ? 'on' : '';
+  var n = lowerShown().length;
+  q('uFix').disabled = !n;
+  q('uFix').textContent = n ? 'UPPERCASE ' + n : 'UPPERCASE';
   var empty = q('emptyUsers');
   empty.style.display = list.length ? 'none' : 'block';
   empty.innerHTML = (PEOPLE || []).length
-    ? 'No user matches that filter.'
+    ? (LOWONLY ? 'Every listed name is already in capitals.' : 'No user matches that filter.')
     : 'No users synced yet &mdash; press <b>Pull from device</b>.';
+}
+
+// Raise the listed small-letter names to capitals here and on the terminal.
+// Only the name moves - the PIN keeps its card, its role and its face.
+function fixCase(){
+  var rows = lowerShown();
+  if (!rows.length) return userNote('every listed name is already in capitals');
+  var sample = rows.slice(0, 4).map(function(u){
+    return u.pin + ' ' + u.name + ' \\u2192 ' + String(u.name).toUpperCase();
+  }).join('\\n');
+  if (!confirm('Raise ' + rows.length + ' name(s) to capitals and push them to the terminal?\\n\\n'
+    + sample + (rows.length > 4 ? '\\n...and ' + (rows.length - 4) + ' more' : ''))) return;
+  q('uFix').disabled = true;
+  userNote('queueing ' + rows.length + ' record(s)...');
+  fetch('/api/users/case', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({pins: rows.map(function(u){ return String(u.pin); })})})
+    .then(function(r){ return r.json(); })
+    .catch(function(){ return {ok:false, error:'server unreachable'}; })
+    .then(function(j){
+      if (!j.ok) return userNote(j.error || 'could not raise these names');
+      userNote('queued ' + j.queued.length + ' command(s) for ' + j.targets.length
+        + ' terminal(s) - collected on the next poll.');
+      CASE_TIMER = setTimeout(function(){
+        bulkWatch(j.batch, Date.now() + 180000, userNote);
+      }, 1600);
+      refresh();
+    });
 }
 
 function renderTrace(){
@@ -2857,21 +3064,31 @@ var BULK = null, BULK_TIMER = null, PICK = 'all';
 var BULK_LABEL = {new:'new', update:'update', same:'unchanged', dupe:'repeat',
                   header:'heading', error:'problem'};
 // mirrors the server's sets, so the button can be re-counted without asking
-var PICK_SET = {all:['new','update','same'], new:['new'], update:['update'], same:['same']};
-var PICK_WORD = {all:'', new:'new ', update:'changed ', same:'unchanged '};
+var SENDABLE = ['new','update','same'];
+var PICK_SET = {all:SENDABLE, new:['new'], update:['update'], same:['same'], dup:SENDABLE};
+var PICK_WORD = {all:'', new:'new ', update:'changed ', same:'unchanged ', dup:'duplicated '};
 
 function bulkNote(msg){ q('bMsg').textContent = msg; }
 
 function pickCount(c){
   if (!c) return 0;
+  if (PICK === 'dup') return c.dup || 0;
   return PICK_SET[PICK].reduce(function(n, k){ return n + (c[k] || 0); }, 0);
+}
+
+// a row is in the duplicate view by its flag, not by its status - it keeps
+// whatever new/changed/unchanged it earned
+function rowInPick(tr){
+  var st = tr.getAttribute('data-st');
+  if (PICK === 'dup') return tr.getAttribute('data-dup') === '1' && SENDABLE.indexOf(st) >= 0;
+  return PICK_SET[PICK].indexOf(st) >= 0;
 }
 
 // The paste is graded once; which slice of it goes out is a local decision, so
 // changing the pick re-counts the button and re-shades the table on the spot.
 function setPick(p){
   PICK = PICK_SET[p] ? p : 'all';
-  ['all','new','update','same'].forEach(function(k){
+  ['all','new','update','same','dup'].forEach(function(k){
     q('pk' + k).className = k === PICK ? 'on' : '';
   });
   paintRows();
@@ -2880,10 +3097,8 @@ function setPick(p){
 }
 
 function paintRows(){
-  var set = PICK_SET[PICK], trs = q('bRows').children;
-  for (var i = 0; i < trs.length; i++){
-    trs[i].className = set.indexOf(trs[i].getAttribute('data-st')) >= 0 ? '' : 'skip';
-  }
+  var trs = q('bRows').children;
+  for (var i = 0; i < trs.length; i++) trs[i].className = rowInPick(trs[i]) ? '' : 'skip';
 }
 
 function bulkLabel(){
@@ -2903,12 +3118,18 @@ function labelSegs(c){
   q('pknew').textContent = 'New' + n('new');
   q('pkupdate').textContent = 'Changed' + n('update');
   q('pksame').textContent = 'Unchanged' + n('same');
+  q('pkdup').textContent = 'Dupes' + n('dup');
+}
+
+// the grade depends on the CAPS toggle, so flipping it re-reads the same paste
+function bulkRegrade(){
+  if (BULK && q('bText').value.trim()) bulkPreview();
 }
 
 function bulkCall(dry){
   return fetch('/api/users/import', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({text: q('bText').value, pri: q('bPri').value,
-      pick: PICK, dryRun: dry})})
+      pick: PICK, upper: q('bUpper').checked, dryRun: dry})})
     .then(function(r){ return r.json(); })
     .catch(function(){ return {ok:false, error:'server unreachable'}; });
 }
@@ -2934,9 +3155,11 @@ function bulkShow(j){
   var rows = j.rows || [], c = j.counts || {};
   q('bWrap').style.display = rows.length ? 'block' : 'none';
   q('bRows').innerHTML = rows.map(function(r){
-    return '<tr data-st="' + r.status + '"><td class="mono">' + r.line + '</td><td class="mono">'
+    return '<tr data-st="' + r.status + '" data-dup="' + (r.dup ? 1 : 0) + '">'
+      + '<td class="mono">' + r.line + '</td><td class="mono">'
       + esc(r.pin) + '</td><td>' + esc(r.name) + '</td><td class="mono">' + esc(r.card || '-')
       + '</td><td><span class="st ' + r.status + '">' + (BULK_LABEL[r.status] || r.status) + '</span>'
+      + (r.dup ? ' <span class="st dup">duplicate</span>' : '')
       + (r.note ? ' <span class="hint">' + esc(r.note) + '</span>' : '') + '</td></tr>';
   }).join('');
   labelSegs(c);
@@ -2948,8 +3171,13 @@ function bulkShow(j){
     if (c[k]) chips.push('<span class="st ' + k + '">' + c[k] + ' ' + BULK_LABEL[k] + '</span>');
   });
   if (j.over) chips.push('<span class="st error">' + j.over + ' line(s) over the limit, dropped</span>');
-  q('bCounts').innerHTML = chips.length
-    ? '<span class="hint">never sent:</span> ' + chips.join(' ') : '';
+  var head = chips.length ? '<span class="hint">never sent:</span> ' + chips.join(' ') : '';
+  if (c.dupAll){
+    head += (head ? '<span class="hint" style="margin:0 8px">&middot;</span>' : '')
+      + '<span class="hint">already on file twice:</span> <span class="st dup">'
+      + c.dupAll + ' duplicate name(s)</span>';
+  }
+  q('bCounts').innerHTML = head;
   bulkLabel();
   if (j.error) return bulkNote(j.error);
   if (j.dryRun) bulkNote(bulkReady(c));
@@ -2974,28 +3202,33 @@ function bulkPush(){
 
 // Queued is only half the answer: what matters is what the terminal said back,
 // so keep asking until every record has a reply or the wait runs out.
-function bulkWatch(batch, deadline){
+function bulkWatch(batch, deadline, note){
+  // a paste and a case fix are the same queue seen from two panels, so the
+  // watcher writes wherever it was told to rather than always into the paste
+  note = note || bulkNote;
   clearTimeout(BULK_TIMER);
+  clearTimeout(CASE_TIMER);
   fetch('/api/users/import/status?batch=' + batch)
     .then(function(r){ return r.json(); })
     .then(function(s){
       var left = s.total - s.returned;
       if (!left){
-        bulkNote(s.failed
+        note(s.failed
           ? (s.total - s.failed) + ' of ' + s.total + ' accepted, ' + s.failed + ' refused: '
             + s.failures.map(function(f){ return 'PIN ' + f.pin + ' (' + f.result + ')'; }).join(', ')
           : 'all ' + s.total + ' record(s) accepted by the terminal.');
         return refresh();
       }
       if (Date.now() > deadline){
-        return bulkNote(s.returned + ' of ' + s.total + ' confirmed, ' + left
+        return note(s.returned + ' of ' + s.total + ' confirmed, ' + left
           + ' unanswered - check the terminal is online and still polling.');
       }
-      bulkNote(s.returned + ' of ' + s.total + ' confirmed'
+      note(s.returned + ' of ' + s.total + ' confirmed'
         + (s.failed ? ', ' + s.failed + ' refused' : '') + ' - waiting for the rest...');
-      BULK_TIMER = setTimeout(function(){ bulkWatch(batch, deadline); }, 3000);
+      var again = setTimeout(function(){ bulkWatch(batch, deadline, note); }, 3000);
+      if (note === bulkNote) BULK_TIMER = again; else CASE_TIMER = again;
     })
-    .catch(function(){ bulkNote('lost contact with the server while waiting.'); });
+    .catch(function(){ note('lost contact with the server while waiting.'); });
 }
 
 function purge(){
