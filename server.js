@@ -16,6 +16,7 @@
 process.env.TZ = process.env.APP_TZ || 'Asia/Kolkata';
 
 const http = require('http');
+const https = require('https');   // a webhook may point at either
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -36,6 +37,10 @@ const MARK_FILE = path.join(DATA_DIR, 'marks.json');
 // Who has been through the HR door. Employee attendance leaves this server
 // through that API, so every call - admitted or refused - is written down.
 const HRLOG_FILE = path.join(DATA_DIR, 'hrlog.jsonl');
+// Where this server sends punches, and what happened when it did.
+const HOOKS_FILE = path.join(DATA_DIR, 'hooks.json');
+const HOOKLOG_FILE = path.join(DATA_DIR, 'hooklog.jsonl');
+const HOOKLOG_MAX = 2000;
 const HRLOG_MAX = 2000;   // kept in memory; the file keeps the rest
 const snList = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
 // The terminals stamp punches with their own clock, which is rarely Indian
@@ -211,6 +216,10 @@ const state = {
   // dedupe key, so a re-sync of the same punch keeps its mark and a device
   // never overwrites one.
   marks: {},
+  // Outbound webhooks. Each one names a range of PINs, so a receiver is only
+  // ever sent the people it is meant to see - the range is enforced here, at
+  // the only place that knows every punch.
+  hooks: [],
   // allowIps: HR API allow-list, empty = denied. faceOnly: attendance counts
   // face-verified punches only. dwellSec: gate re-tap window, see below.
   // hrKey: optional second lock on the HR/sync API, checked after the IP list
@@ -219,6 +228,8 @@ const state = {
 const seen = new Set();          // dedupe key for punches
 const hrLog = [];                // recent HR API calls, newest last
 const feeds = [];                // open live streams: {res, ip, pins, since, sent}
+const hookLog = [];              // recent webhook deliveries, newest last
+const hookQueue = [];            // deliveries waiting on a retry
 let cmdSeq = Date.now() % 100000;
 
 function loadState() {
@@ -232,6 +243,16 @@ function loadState() {
   } catch (e) { /* first run */ }
   try { state.users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {}
   try { state.marks = JSON.parse(fs.readFileSync(MARK_FILE, 'utf8')); } catch (e) {}
+  try {
+    const rows = JSON.parse(fs.readFileSync(HOOKS_FILE, 'utf8'));
+    if (Array.isArray(rows)) state.hooks = rows;
+  } catch (e) { /* none configured */ }
+  try {
+    const lines = fs.readFileSync(HOOKLOG_FILE, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines.slice(-HOOKLOG_MAX)) {
+      try { hookLog.push(JSON.parse(line)); } catch (e) { /* torn line */ }
+    }
+  } catch (e) { /* nothing delivered yet */ }
   // only the tail: this file grows with every call and none of it is needed
   // beyond what the panel shows
   try {
@@ -273,6 +294,7 @@ function saveSoon() {
       fs.writeFileSync(DEV_FILE, JSON.stringify(state.devices, null, 2));
       fs.writeFileSync(SET_FILE, JSON.stringify(state.settings, null, 2));
       fs.writeFileSync(MARK_FILE, JSON.stringify(state.marks, null, 2));
+      fs.writeFileSync(HOOKS_FILE, JSON.stringify(state.hooks, null, 2));
     } catch (e) { console.error('save failed', e.message); }
   }, 800);
 }
@@ -433,7 +455,144 @@ function addPunch(sn, rawPin, devTime, status, verify, workcode, extra, offset) 
   // This line is reached once per genuinely new punch and never for a repeat,
   // which is exactly the moment a listener wants to hear about.
   feedPush(rec);
+  hookPush(rec);
   return true;
+}
+
+/* ------------------------------------------------------------- webhooks */
+
+// A receiver is told about the people it asked for and nobody else. The range
+// is a pair of PINs, inclusive, and it is applied here rather than trusted to
+// the far end - this is the only place that sees every punch, so it is the
+// only place the filter can actually hold.
+function hookWants(hook, pin) {
+  if (!hook.active) return false;
+  const n = Number(pin);
+  if (!Number.isFinite(n)) return false;
+  const from = Number(hook.from);
+  const to = Number(hook.to);
+  if (Number.isFinite(from) && n < from) return false;
+  if (Number.isFinite(to) && n > to) return false;
+  return true;
+}
+
+function hookRange(hook) {
+  const from = Number.isFinite(Number(hook.from)) ? Number(hook.from) : null;
+  const to = Number.isFinite(Number(hook.to)) ? Number(hook.to) : null;
+  if (from === null && to === null) return 'everyone';
+  if (from !== null && to !== null) return from + ' to ' + to;
+  return from !== null ? from + ' and up' : 'up to ' + to;
+}
+
+function hookTrace(row) {
+  hookLog.push(row);
+  if (hookLog.length > HOOKLOG_MAX) hookLog.splice(0, hookLog.length - HOOKLOG_MAX);
+  try { fs.appendFileSync(HOOKLOG_FILE, JSON.stringify(row) + '\n'); } catch (e) { /* best effort */ }
+}
+
+function hookById(id) {
+  return state.hooks.find((h) => String(h.id) === String(id)) || null;
+}
+
+// One delivery. A receiver that is down is retried on a widening delay rather
+// than dropped - a punch is a fact, and losing it because a server was
+// restarting would be the worst kind of quiet failure.
+const HOOK_RETRIES = [0, 5000, 30000, 120000, 600000];
+
+function hookSend(hook, event, body, attempt) {
+  const id = hook.id;
+  const payload = JSON.stringify({ event, sent_at: new Date().toISOString(), data: body });
+  let target;
+  try { target = new URL(hook.url); } catch (e) {
+    hookTrace({ t: Date.now(), hook: id, name: hook.name, url: hook.url, event,
+      pin: body && body.pin, ok: false, status: 0, ms: 0, attempt,
+      error: 'that is not a URL' });
+    return;
+  }
+  const lib = target.protocol === 'https:' ? https : http;
+  const t0 = Date.now();
+  const req = lib.request({
+    protocol: target.protocol, hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    path: target.pathname + target.search, method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+      'X-API-Key': hook.key || '',
+      'X-Webhook-Event': event,
+      'X-Webhook-Id': String(id),
+      'User-Agent': 'aiface-mars-hook/1',
+    },
+    timeout: 15000,
+  }, (res) => {
+    res.resume();
+    res.on('end', () => {
+      const okish = res.statusCode >= 200 && res.statusCode < 300;
+      hookDone(hook, event, body, attempt, okish, res.statusCode, Date.now() - t0,
+        okish ? '' : 'receiver answered ' + res.statusCode);
+    });
+  });
+  req.on('timeout', () => { req.destroy(new Error('timed out after 15s')); });
+  req.on('error', (err) => {
+    hookDone(hook, event, body, attempt, false, 0, Date.now() - t0, err.message);
+  });
+  req.end(payload);
+}
+
+function hookDone(hook, event, body, attempt, okish, status, ms, error) {
+  hookTrace({ t: Date.now(), hook: hook.id, name: hook.name, url: hook.url, event,
+    pin: (body && body.pin) || '', ok: okish, status, ms, attempt, error });
+  const live = hookById(hook.id);
+  if (live) {
+    live.stats = live.stats || { sent: 0, failed: 0 };
+    if (okish) live.stats.sent = (live.stats.sent || 0) + 1;
+    else live.stats.failed = (live.stats.failed || 0) + 1;
+    live.stats.lastAt = Date.now();
+    live.stats.lastStatus = status;
+    live.stats.lastError = okish ? '' : error;
+    saveSoon();
+  }
+  if (okish) return;
+  const next = HOOK_RETRIES[attempt + 1];
+  if (next === undefined) {
+    trace('err', '', 'webhook "' + hook.name + '" gave up on PIN '
+      + ((body && body.pin) || '?') + ' after ' + (attempt + 1) + ' attempt(s)');
+    return;
+  }
+  const timer = setTimeout(() => {
+    const i = hookQueue.indexOf(timer);
+    if (i >= 0) hookQueue.splice(i, 1);
+    const still = hookById(hook.id);
+    if (still && still.active) hookSend(still, event, body, attempt + 1);
+  }, next);
+  hookQueue.push(timer);
+}
+
+// What a receiver is told when somebody walks through the door.
+function hookBody(rec) {
+  const date = dayOf(rec.time);
+  return {
+    pin: rec.pin,
+    name: rec.name || (state.users[rec.pin] && cmdField(state.users[rec.pin].name)) || '',
+    time: isoStamp(rec.time),
+    local_time: rec.time,
+    session_date: date,
+    session_uid: rec.pin + '|' + date,
+    device_key: punchKey(rec),
+    gate: rec.sn,
+    direction: dirOf(rec),
+    verify: rec.verify,
+    verified_by: VERIFY[rec.verify] || ('mode ' + rec.verify),
+  };
+}
+
+function hookPush(rec) {
+  if (!state.hooks.length) return;
+  const body = hookBody(rec);
+  for (const hook of state.hooks) {
+    if (!hookWants(hook, rec.pin)) continue;
+    hookSend(hook, 'attendance.punch', body, 0);
+  }
 }
 
 /* ------------------------------------------------------------ live feed */
@@ -2296,6 +2455,92 @@ async function handleApi(req, res, route, q) {
     trace('info', '', 'door requested from ' + clientIp(req) + ' -> ' + online.length + ' terminal(s)');
     return jsonOut(res, { ok: true, targets: online, queued: queued.map((c) => ({ id: c.id, sn: c.sn })) });
   }
+  // ---- webhooks: where punches are sent, and what happened when they were
+  if (route === '/api/hooks' && req.method === 'GET') {
+    return jsonOut(res, {
+      hooks: state.hooks.map((h) => Object.assign({}, h, {
+        key: h.key ? '••••••••' + String(h.key).slice(-4) : '',
+        keySet: !!h.key, rangeLabel: hookRange(h),
+      })),
+      pending: hookQueue.length,
+    });
+  }
+
+  if (route === '/api/hooks' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    const url = String(p.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      return jsonOut(res, { ok: false, error: 'the link must start with http:// or https://' }, 400);
+    }
+    const num = (v) => (v === '' || v === null || v === undefined || !Number.isFinite(Number(v))
+      ? null : Number(v));
+    const from = num(p.from);
+    const to = num(p.to);
+    if (from !== null && to !== null && from > to) {
+      return jsonOut(res, { ok: false, error: 'the range starts after it ends' }, 400);
+    }
+    const existing = p.id ? hookById(p.id) : null;
+    if (p.id && !existing) return jsonOut(res, { ok: false, error: 'no such webhook' }, 404);
+    const hook = existing || {
+      id: 'wh_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      created: Date.now(), stats: { sent: 0, failed: 0 },
+    };
+    hook.name = String(p.name || '').trim().slice(0, 60) || 'Webhook';
+    hook.url = url;
+    hook.from = from;
+    hook.to = to;
+    hook.active = p.active !== false;
+    // a blank key on an edit means "leave it": the panel only ever shows dots
+    const key = String(p.key || '').trim();
+    if (key && !key.includes('•')) hook.key = key;
+    if (!existing) {
+      if (!hook.key) hook.key = 'whk_' + Math.random().toString(36).slice(2, 12)
+        + Math.random().toString(36).slice(2, 12);
+      state.hooks.push(hook);
+    }
+    saveSoon();
+    trace('info', '', (existing ? 'webhook updated: ' : 'webhook added: ') + hook.name
+      + ' -> ' + hook.url + ' (' + hookRange(hook) + ')');
+    // the key is shown in full exactly once, when it is made, so it can be
+    // pasted into the receiver - after that only its last four
+    return jsonOut(res, { ok: true, hook, newKey: existing ? '' : hook.key });
+  }
+
+  if (route === '/api/hooks/delete' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    const i = state.hooks.findIndex((h) => String(h.id) === String(p.id));
+    if (i < 0) return jsonOut(res, { ok: false, error: 'no such webhook' }, 404);
+    const [gone] = state.hooks.splice(i, 1);
+    saveSoon();
+    trace('info', '', 'webhook removed: ' + gone.name);
+    return jsonOut(res, { ok: true, removed: gone.id });
+  }
+
+  // Prove the link before a real punch depends on it.
+  if (route === '/api/hooks/test' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    const hook = hookById(p.id);
+    if (!hook) return jsonOut(res, { ok: false, error: 'no such webhook' }, 404);
+    hookSend(hook, 'attendance.test', {
+      pin: 'test', name: 'Test delivery', time: new Date().toISOString(),
+      note: 'This is a test from the attendance server. Nobody walked through a door.',
+    }, 0);
+    return jsonOut(res, { ok: true, note: 'sent - watch the log below for the answer' });
+  }
+
+  if (route === '/api/hooks/log') {
+    const limit = Math.min(Math.max(Number(q.get('limit')) || 150, 1), 500);
+    const id = q.get('hook') || '';
+    const rows = (id ? hookLog.filter((r) => String(r.hook) === id) : hookLog);
+    return jsonOut(res, {
+      total: rows.length, pending: hookQueue.length,
+      calls: rows.slice(-limit).reverse(),
+    });
+  }
+
   if (route === '/api/stats') return jsonOut(res, serverStats(q.get('days')));
   if (route === '/api/settings' && req.method === 'GET') {
     return jsonOut(res, {
@@ -3324,6 +3569,57 @@ h1{font-size:15px}
   </div>
 
   <div class="panel">
+    <h2>Webhooks
+      <span class="row">
+        <span class="seg" id="whTabs">
+          <button class="on" id="whTabSet" onclick="whTab('set')">Webhooks</button>
+          <button id="whTabLog" onclick="whTab('log')">Delivery log</button>
+        </span>
+        <button onclick="loadHooks()">Refresh</button>
+      </span>
+    </h2>
+    <div class="body">
+      <div id="whSet">
+        <div class="note" style="margin-bottom:10px">A webhook is pushed the moment somebody
+        walks through the door &mdash; no one has to ask for it. Each one carries its own range
+        of numbers, so a receiver is only ever sent the people it is meant to see; the range is
+        applied here, which is the only place that sees every punch. Create the webhook in HR or
+        the academy, paste its link and key below, and press <b>Test</b> before trusting it.</div>
+        <div class="row" style="align-items:flex-end">
+          <label class="hint" style="flex:2;min-width:150px">Name<br>
+            <input id="whName" placeholder="HR live attendance" style="margin-top:4px"></label>
+          <label class="hint" style="flex:3;min-width:220px">Link<br>
+            <input id="whUrl" placeholder="https://hr.example.com/api/hooks/attendance" style="margin-top:4px"></label>
+        </div>
+        <div class="row" style="align-items:flex-end;margin-top:8px">
+          <label class="hint" style="flex:2;min-width:200px">API key from the receiver<br>
+            <input id="whKey" placeholder="left blank = one is made for you" style="margin-top:4px"></label>
+          <label class="hint" style="flex:1;min-width:96px">People from<br>
+            <input id="whFrom" type="number" placeholder="any" style="margin-top:4px"></label>
+          <label class="hint" style="flex:1;min-width:96px">to<br>
+            <input id="whTo" type="number" placeholder="any" style="margin-top:4px"></label>
+          <button class="p" id="whSave" onclick="saveHook()" style="flex:0 0 auto">Add webhook</button>
+          <button id="whCancel" onclick="resetHook()" style="flex:0 0 auto;display:none">Cancel</button>
+        </div>
+        <div class="note" id="whMsg" style="margin-top:8px"></div>
+        <div class="scroll" style="max-height:300px;margin-top:10px">
+          <table><thead><tr><th>Name</th><th>Link</th><th>People</th><th>Sent</th><th>Failed</th>
+          <th>Last</th><th></th></tr></thead><tbody id="whRows"></tbody></table>
+          <div class="empty" id="whNone">No webhook yet &mdash; nothing is being pushed anywhere.</div>
+        </div>
+      </div>
+      <div id="whLog" style="display:none">
+        <div class="note" id="whLogSum" style="margin-bottom:10px"></div>
+        <div class="scroll" style="max-height:420px">
+          <table><thead><tr><th>Time</th><th>Webhook</th><th>Event</th><th>PIN</th>
+          <th>Result</th><th>Took</th></tr></thead><tbody id="whLogRows"></tbody></table>
+          <div class="empty" id="whLogNone">Nothing has been delivered yet.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
     <h2>Who is calling the HR API
       <span class="row">
         <span class="note" id="hrLogSum"></span>
@@ -3474,7 +3770,7 @@ function showTab(name){
   if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
   if (name === 'door') loadDoor();
   if (name === 'info') loadStats();
-  if (name === 'srv') { loadIps(); loadHrLog(); }
+  if (name === 'srv') { loadIps(); loadHrLog(); loadHooks(); }
   refresh();
 }
 document.getElementById('tabs').addEventListener('click', function(e){
@@ -3497,7 +3793,7 @@ function boot(){
   showTab(saved);
   loadIps();
   setInterval(function(){ if (TAB === 'info') loadStats(); }, 30000);
-  setInterval(function(){ if (TAB === 'srv') loadHrLog(); }, 10000);
+  setInterval(function(){ if (TAB === 'srv') { loadHrLog(); loadHooks(); } }, 10000);
   setInterval(function(){ if (TAB === 'door') loadDoor(); }, 5000);
 }
 
@@ -4830,6 +5126,140 @@ function loadStats(){
       + card('sm', 'Host', esc(t.host.hostname || '?'))
       + card('sm', 'PID', t.proc.pid)
       + '</div>';
+  });
+}
+
+/* ------ webhooks: where punches are pushed, and how that went */
+var WH_TAB = 'set', WH_EDIT = null;
+
+function whTab(name){
+  WH_TAB = name;
+  q('whTabSet').className = name === 'set' ? 'on' : '';
+  q('whTabLog').className = name === 'log' ? 'on' : '';
+  q('whSet').style.display = name === 'set' ? '' : 'none';
+  q('whLog').style.display = name === 'log' ? '' : 'none';
+  loadHooks();
+}
+
+function whNote(msg, bad){
+  q('whMsg').innerHTML = msg
+    ? '<span style="color:var(--' + (bad ? 'bad' : 'ok') + ')">' + esc(msg) + '</span>' : '';
+}
+
+function resetHook(){
+  WH_EDIT = null;
+  ['whName','whUrl','whKey','whFrom','whTo'].forEach(function(k){ q(k).value = ''; });
+  q('whSave').textContent = 'Add webhook';
+  q('whCancel').style.display = 'none';
+  whNote('');
+}
+
+function editHook(id){
+  var h = (WH_LIST || []).filter(function(x){ return x.id === id; })[0];
+  if (!h) return;
+  WH_EDIT = id;
+  q('whName').value = h.name || '';
+  q('whUrl').value = h.url || '';
+  q('whKey').value = '';
+  q('whFrom').value = h.from === null || h.from === undefined ? '' : h.from;
+  q('whTo').value = h.to === null || h.to === undefined ? '' : h.to;
+  q('whSave').textContent = 'Save changes';
+  q('whCancel').style.display = '';
+  whNote('editing "' + (h.name || '') + '" - leave the key blank to keep the one it has');
+}
+
+function saveHook(){
+  var body = {
+    name: q('whName').value.trim(), url: q('whUrl').value.trim(),
+    key: q('whKey').value.trim(),
+    from: q('whFrom').value.trim(), to: q('whTo').value.trim(),
+  };
+  if (WH_EDIT) body.id = WH_EDIT;
+  if (!body.url) return whNote('paste the link the receiver gave you', true);
+  fetch('/api/hooks', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok) return whNote(j.error || 'could not save', true);
+      var made = WH_EDIT ? '' : j.newKey;
+      resetHook();
+      loadHooks();
+      // shown once, because after this only the last four are ever returned
+      if (made) whNote('added. Its key is ' + made + ' - copy it into the receiver now, '
+        + 'it is not shown again.');
+      else whNote('saved');
+    });
+}
+
+function testHook(id){
+  whNote('sending a test...');
+  fetch('/api/hooks/test', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: id})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      whNote(j.ok ? j.note : (j.error || 'could not send'), !j.ok);
+      setTimeout(loadHooks, 1200);
+    });
+}
+
+function dropHook(id){
+  var h = (WH_LIST || []).filter(function(x){ return x.id === id; })[0] || {};
+  if (!confirm('Remove the webhook "' + (h.name || id) + '"?\\n\\nNothing more will be pushed '
+    + 'to ' + (h.url || 'it') + '.')) return;
+  fetch('/api/hooks/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: id})})
+    .then(function(){ resetHook(); loadHooks(); });
+}
+
+var WH_LIST = [];
+
+function loadHooks(){
+  fetch('/api/hooks').then(function(r){ return r.json(); }).then(function(j){
+    WH_LIST = j.hooks || [];
+    q('whNone').style.display = WH_LIST.length ? 'none' : 'block';
+    q('whRows').innerHTML = WH_LIST.map(function(h){
+      var st = h.stats || {};
+      return '<tr' + (h.active ? '' : ' style="opacity:.55"') + '>'
+        + '<td>' + esc(h.name) + (h.active ? '' : ' <span class="st">off</span>') + '</td>'
+        + '<td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis">'
+        + esc(h.url) + '</td>'
+        + '<td class="mono">' + esc(h.rangeLabel) + '</td>'
+        + '<td class="mono">' + num(st.sent || 0) + '</td>'
+        + '<td class="mono">' + (st.failed
+            ? '<span style="color:#f87171">' + num(st.failed) + '</span>' : '0') + '</td>'
+        + '<td>' + (st.lastAt
+            ? esc(ago(st.lastAt)) + (st.lastError
+                ? ' <span class="st error">' + esc(String(st.lastError).slice(0, 34)) + '</span>'
+                : ' <span class="st new">' + (st.lastStatus || 200) + '</span>')
+            : '<span class="hint">never</span>') + '</td>'
+        + '<td style="text-align:right;white-space:nowrap">'
+        + '<button class="vw" onclick="testHook(\\'' + esc(h.id) + '\\')">Test</button> '
+        + '<button class="vw" onclick="editHook(\\'' + esc(h.id) + '\\')">Edit</button> '
+        + '<button class="rm" onclick="dropHook(\\'' + esc(h.id) + '\\')">Remove</button>'
+        + '</td></tr>';
+    }).join('');
+  });
+  if (WH_TAB !== 'log') return;
+  fetch('/api/hooks/log').then(function(r){ return r.json(); }).then(function(j){
+    var calls = j.calls || [];
+    q('whLogNone').style.display = calls.length ? 'none' : 'block';
+    q('whLogSum').textContent = j.total
+      ? j.total + ' delivery attempt(s)' + (j.pending ? ', ' + j.pending + ' waiting on a retry' : '')
+      : 'nothing delivered yet';
+    q('whLogRows').innerHTML = calls.map(function(r){
+      return '<tr' + (r.ok ? '' : ' style="opacity:.8"') + '>'
+        + '<td class="mono">' + esc(stampOf(r.t)) + '</td>'
+        + '<td>' + esc(r.name || r.hook) + '</td>'
+        + '<td class="mono hint">' + esc(r.event) + '</td>'
+        + '<td class="mono">' + esc(r.pin || '-') + '</td>'
+        + '<td>' + (r.ok
+            ? '<span class="st new">' + (r.status || 200) + '</span>'
+            : '<span class="st error">' + (r.status || 'no answer') + '</span>'
+              + (r.error ? ' <span class="hint">' + esc(r.error) + '</span>' : '')
+              + (r.attempt ? ' <span class="hint">try ' + (r.attempt + 1) + '</span>' : ''))
+        + '</td>'
+        + '<td class="mono hint">' + (r.ms || 0) + ' ms</td></tr>';
+    }).join('');
   });
 }
 

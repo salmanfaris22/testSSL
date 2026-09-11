@@ -8,3 +8,7 @@ data/photos/
 
 # The HR door's access log. Grows per call and is local operational history.
 data/hrlog.jsonl
+
+# Webhook targets and their delivery log: local operational state.
+data/hooks.json
+data/hooklog.jsonl
