@@ -25,6 +25,11 @@ const PORT = Number(process.env.PORT || 8080);
 const DATA_DIR = path.join(__dirname, 'data');
 const ATT_FILE = path.join(DATA_DIR, 'attlog.jsonl');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
+// One file per person rather than a field on the record: users.json is
+// rewritten whole on every save, and a base64 portrait in it would be copied
+// out to disk on each one.
+const PHOTO_DIR = path.join(DATA_DIR, 'photos');
+const PHOTO_MAX = 1024 * 1024;   // an enrolment snapshot, not a photo library
 const DEV_FILE = path.join(DATA_DIR, 'devices.json');
 const SET_FILE = path.join(DATA_DIR, 'settings.json');
 const MARK_FILE = path.join(DATA_DIR, 'marks.json');
@@ -473,6 +478,8 @@ function parseOperlog(sn, body) {
         const t = line.split(/\s/)[0].toUpperCase();
         u.bio = u.bio || {};
         u.bio[t] = (u.bio[t] || 0) + 1;
+        // the picture rides in the same line as the count that was being kept
+        if (o.Content && (t === 'USERPIC' || t === 'BIOPHOTO')) savePhoto(pin, t, o.Content);
       }
     } else if (/^OPLOG\s/i.test(line)) {
       trace('dev', sn, 'OPLOG ' + line.slice(0, 120));
@@ -480,6 +487,58 @@ function parseOperlog(sn, body) {
   }
   if (users) { saveSoon(); trace('dev', sn, 'USERINFO -> ' + users + ' user record(s)'); }
   return users;
+}
+
+// A face template is not a picture and cannot be shown, so what arrives is
+// only kept when it actually decodes to an image. USERPIC is the enrolment
+// portrait and wins over BIOPHOTO, which is whatever still the face engine
+// happened to keep - between two of the same kind, the newer one wins.
+function imageType(buf) {
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e) return 'image/png';
+  return '';
+}
+
+function savePhoto(pin, kind, b64) {
+  let buf;
+  try { buf = Buffer.from(String(b64).replace(/\s+/g, ''), 'base64'); } catch (e) { return; }
+  if (!buf.length || buf.length > PHOTO_MAX) return;
+  const type = imageType(buf);
+  if (!type) return;
+  const u = state.users[pin];
+  const had = u && u.photo;
+  if (had && had.kind === 'USERPIC' && kind !== 'USERPIC') return;
+  try {
+    fs.mkdirSync(PHOTO_DIR, { recursive: true });
+    fs.writeFileSync(path.join(PHOTO_DIR, pin + (type === 'image/png' ? '.png' : '.jpg')), buf);
+  } catch (e) { return; }
+  if (u) {
+    u.photo = { at: Date.now(), bytes: buf.length, kind, type };
+    saveSoon();
+  }
+  trace('dev', '', 'photo stored for PIN ' + pin + ' (' + kind + ', ' + buf.length + ' bytes)');
+}
+
+// A record can outlive the file, and a file can outlive the record - a photo
+// pulled before this server started keeping the field still has to be findable.
+function photoFile(pin) {
+  for (const ext of ['.jpg', '.png']) {
+    const f = path.join(PHOTO_DIR, pin + ext);
+    try { if (fs.statSync(f).isFile()) return { file: f, type: ext === '.png' ? 'image/png' : 'image/jpeg' }; }
+    catch (e) { /* next */ }
+  }
+  return null;
+}
+
+function photoCount() {
+  let count = 0, bytes = 0;
+  try {
+    for (const f of fs.readdirSync(PHOTO_DIR)) {
+      try { const st = fs.statSync(path.join(PHOTO_DIR, f)); if (st.isFile()) { count++; bytes += st.size; } }
+      catch (e) { /* ignore */ }
+    }
+  } catch (e) { /* no photos yet */ }
+  return { count, bytes };
 }
 
 function parseOptions(sn, body) {
@@ -1269,6 +1328,8 @@ function dirSize(dir) {
 function serverStats(days) {
   const span = Math.min(Math.max(Number(days) || 14, 1), 120);
   const store = dirSize(DATA_DIR);
+  store.photos = photoCount();
+  store.total += store.photos.bytes;
   const today = localDate(new Date());
   const byDay = {};
   const byHour = new Array(24).fill(0);
@@ -1745,6 +1806,22 @@ async function handleApi(req, res, route, q) {
       doorPinSet: !!state.settings.doorPin,
     });
   }
+  // The picture itself. Served from disk rather than through the state payload
+  // so a list of 300 people does not carry 300 portraits with it.
+  if (route === '/api/userpic') {
+    const pin = normPin(q.get('pin') || '');
+    const found = pin && photoFile(pin);
+    if (!found) return jsonOut(res, { ok: false, error: 'no photo on file for that PIN' }, 404);
+    try {
+      const buf = fs.readFileSync(found.file);
+      res.writeHead(200, { 'Content-Type': found.type, 'Content-Length': buf.length,
+        'Cache-Control': 'no-cache' });
+      return res.end(buf);
+    } catch (e) {
+      return jsonOut(res, { ok: false, error: 'photo could not be read' }, 500);
+    }
+  }
+
   if (route === '/health' || route === '/api/health') {
     return jsonOut(res, { status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
   }
@@ -2102,6 +2179,18 @@ h1{font-size:16px;margin:0;letter-spacing:.3px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .card .k{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
 .card .v{font-size:26px;font-weight:600;margin-top:4px}
+.card.sm{padding:11px 13px}
+.card.sm .k{text-transform:none;letter-spacing:0;font-size:11.5px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis}
+.card.sm .v{font-size:16px;margin-top:3px}
+.grid.tight{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+/* how much of the roll the terminal can actually recognise */
+.meter{height:8px;border-radius:6px;background:#0d1117;border:1px solid var(--line);overflow:hidden}
+.meter i{display:block;height:100%;background:var(--accent);border-radius:6px}
+.meter i.warn{background:var(--warn)}
+.meter i.bad{background:#f87171}
+.devcard{border:1px solid var(--line);border-radius:10px;padding:12px 13px;margin-bottom:12px;
+background:#0d1117}
 .cols{display:grid;gap:14px;grid-template-columns:1fr 340px}
 /* a grid track is as wide as its widest child unless told otherwise, and the
    protocol trace is one long unwrapped line - without this the main column
@@ -2174,6 +2263,14 @@ color:var(--dim);white-space:nowrap}
 .st.hold{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
 button.rm{padding:3px 9px;font-size:11px;border-color:rgba(239,68,68,.35);color:#f87171}
 button.rm:hover{border-color:#f87171;background:rgba(239,68,68,.12);color:#fca5a5}
+button.vw{padding:3px 9px;font-size:11px}
+.rule{display:inline-flex;align-items:center;gap:8px;background:#0d1117;border:1px solid var(--line);
+border-radius:7px;padding:5px 6px 5px 11px;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+.rule button{padding:1px 7px;font-size:13px;line-height:1.2;border-color:transparent;
+background:transparent;color:var(--dim)}
+.rule button:hover{color:#f87171;border-color:rgba(239,68,68,.35)}
+#mBody img.face{display:block;margin:0 auto;max-width:100%;border-radius:10px;
+border:1px solid var(--line);background:#0d1117}
 /* a row the current pick would not send - still listed, visibly not going */
 #bRows tr.skip{opacity:.38}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
@@ -2634,10 +2731,12 @@ h1{font-size:15px}
         A rule that could never match is refused rather than saved.
       </div>
       <div class="row">
-        <input id="ipList" placeholder="103.119.254.234, 49.37.*, 10.0.0.0/8  (comma separated)" style="flex:1;min-width:240px">
-        <button class="p" onclick="saveIps()">Save allow-list</button>
-        <button onclick="useMyIp()">Use my IP</button>
+        <input id="ipNew" placeholder="103.119.254.234  or  49.37.*  or  10.0.0.0/8"
+          style="flex:1;min-width:240px" onkeydown="if(event.key==='Enter')addIp()">
+        <button class="p" onclick="addIp()">Add</button>
+        <button onclick="useMyIp()">Add my IP</button>
       </div>
+      <div id="ipRules" class="row" style="margin-top:10px"></div>
       <div id="ipMsg" class="note" style="margin-top:8px"></div>
       <div class="note" style="margin-top:12px">
         <b>Endpoints</b> &mdash; share these with HR:<br>
@@ -2984,7 +3083,9 @@ function renderUsers(){
       + '<td class="mono">' + esc(u.card || '') + '</td>'
       + '<td>' + esc(PRIVILEGE[u.privilege] || u.privilege || 'User') + '</td>'
       + '<td style="color:#8b949e">' + esc(bio) + '</td>'
-      + '<td style="text-align:right"><button class="rm" onclick="removeUser(\\''
+      + '<td style="text-align:right;white-space:nowrap">'
+      + (u.photo ? '<button class="vw" onclick="viewPhoto(\\'' + esc(u.pin) + '\\')">View</button> ' : '')
+      + '<button class="rm" onclick="removeUser(\\''
       + esc(u.pin) + '\\')">Remove</button></td></tr>';
   }).join('');
   var low = (PEOPLE || []).filter(function(u){ return isLower(u.name); }).length;
@@ -3090,21 +3191,36 @@ function render(s){
   } else {
     q('devBox').innerHTML = s.devices.map(function(d){
       var i = d.info || {};
-      return '<div style="margin-bottom:12px">'
+      var faces = Number(i.FaceCount || i.face_count || 0);
+      var users = Number(i.UserCount || i.user_count || 0);
+      var logs = Number(i.TransactionCount || i.transaction_count || 0);
+      // a terminal only recognises the people whose faces it holds, so the
+      // gap between the two counts is the part of the roll that cannot get in
+      var pct = users ? Math.round(faces / users * 100) : 0;
+      var tone = pct >= 90 ? '' : pct >= 60 ? 'warn' : 'bad';
+      return '<div class="devcard">'
         + '<div class="row" style="justify-content:space-between"><b class="mono">' + esc(d.sn) + '</b>'
         + '<span class="row"><span class="badge ' + (d.online?'on':'off') + '">'
         + (d.online?'online':'offline') + '</span>'
         + '<button onclick="cmd(&quot;info&quot;,' + esc(JSON.stringify({sn:d.sn})) + ')">Refresh info</button>'
         + '</span></div>'
-        + '<div class="hint" style="margin-top:6px">'
+        + '<div class="grid tight" style="margin:10px 0">'
+        + card('sm', 'Faces', num(faces)) + card('sm', 'Users', num(users))
+        + card('sm', 'Logs', num(logs))
+        + '</div>'
+        + (users
+            ? '<div class="hint" style="margin-bottom:5px">Faces enrolled &mdash; <b>' + num(faces)
+              + '</b> of <b>' + num(users) + '</b> (' + pct + '%)'
+              + (faces < users ? ' &middot; ' + num(users - faces) + ' cannot be recognised yet' : '')
+              + '</div><div class="meter"><i class="' + tone + '" style="width:'
+              + Math.min(pct, 100) + '%"></i></div>'
+            : '')
+        + '<div class="hint" style="margin-top:10px">'
         + 'IP <b>' + esc(d.ip||'?') + '</b><br>'
         + 'Model <b>' + esc((i.DeviceName || i['~DeviceName'] || 'AIFACE-MARS').split(',')[0]) + '</b>'
         + ' <span class="hint">' + esc(i.Platform || '') + '</span><br>'
         + 'LAN IP <b>' + esc(i.IPAddress || '?') + '</b> &middot; MAC <b>' + esc(i.MAC || '?') + '</b><br>'
         + 'Firmware <b>' + esc(i.FWVersion || i['~ZKFPVersion'] || '?') + '</b><br>'
-        + 'Faces <b>' + esc(i.FaceCount || i.face_count || '?') + '</b> &middot; '
-        + 'Users <b>' + esc(i.UserCount || i.user_count || '?') + '</b> &middot; '
-        + 'Logs <b>' + esc(i.TransactionCount || i.transaction_count || '?') + '</b><br>'
         + 'Last contact <b>' + (d.lastSeen ? ago(d.lastSeen) : 'never') + '</b><br>'
         + (d.clockOffset
             ? 'Terminal clock <b>' + Math.abs(d.clockOffset) + ' min '
@@ -3673,6 +3789,12 @@ function renderAtt(a){
     + 'into its neighbour, so tapping out and straight back in reads as a break of at least a minute.'
     + (t.ignored ? ' <b>' + t.ignored + '</b> card or fingerprint punch(es) in this range were not counted.' : '');
 }
+// the same card at a smaller size, for a fact that reads as a word
+function card(cls, k, v){
+  return '<div class="card ' + cls + '"><div class="k" title="' + esc(String(k)) + '">'
+    + esc(String(k)) + '</div><div class="v">' + v + '</div></div>';
+}
+
 function kpi(k, v, col){
   return '<div class="card"><div class="k">' + k + '</div><div class="v"'
     + (col ? ' style="color:' + col + '"' : '') + '>' + v + '</div></div>';
@@ -3828,6 +3950,25 @@ function openDay(i){
   }
   q('modal').style.display = 'block';
 }
+// The portrait the terminal enrolled the face against. It arrives with the
+// user sync rather than on request, so a face that has never been synced has
+// no picture here and the button is simply not drawn.
+function viewPhoto(pin){
+  var u = (PEOPLE || []).filter(function(x){ return String(x.pin) === String(pin); })[0] || {};
+  var p = u.photo || {};
+  q('mTitle').textContent = (u.name || ('PIN ' + pin)) + '  -  PIN ' + pin;
+  q('mDate').textContent = p.at
+    ? (p.kind === 'USERPIC' ? 'enrolment photo' : 'face photo') + ', '
+      + Math.round((p.bytes || 0) / 1024) + ' KB, synced ' + stampOf(p.at)
+    : 'from the terminal';
+  q('mBody').innerHTML = '<div style="padding:10px 0">'
+    + '<img class="face" src="/api/userpic?pin=' + encodeURIComponent(pin) + '&t=' + Date.now()
+    + '" alt="" onerror="this.parentNode.innerHTML='
+    + '&quot;<div class=\\&quot;empty\\&quot;>The picture could not be read.</div>&quot;">'
+    + '</div>';
+  q('modal').style.display = 'block';
+}
+
 function closeModal(e){ if (!e || e.target === q('modal')) q('modal').style.display = 'none'; }
 document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeModal(); });
 
@@ -3928,17 +4069,29 @@ function loadStats(){
             + '<td>' + (d.lastSeen ? esc(stampOf(d.lastSeen)) : 'never') + '</td></tr>';
         }).join('')
       + '</tbody></table></div>'
-      + '<div class="hint" style="margin-top:12px">Files in ./data &mdash; '
-      + t.store.files.map(function(f){ return esc(f.name) + ' <b>' + bytes(f.bytes) + '</b>'; }).join(' &middot; ')
+      + '<div class="hint" style="margin:16px 0 6px">Files in ./data</div>'
+      + '<div class="grid tight">'
+      + t.store.files.map(function(f){ return card('sm', f.name, bytes(f.bytes)); }).join('')
+      + (t.store.photos && t.store.photos.count
+          ? card('sm', 'photos/', num(t.store.photos.count) + ' &middot; ' + bytes(t.store.photos.bytes))
+          : '')
       + '</div>'
-      + '<div class="hint" style="margin-top:6px">Node ' + esc(t.proc.node) + ' &middot; '
-      + esc(t.host.platform) + ' &middot; ' + t.host.cpus + ' CPU &middot; port ' + t.proc.port + '</div>';
+      + '<div class="hint" style="margin:16px 0 6px">Runtime</div>'
+      + '<div class="grid tight">'
+      + card('sm', 'Node', esc(t.proc.node))
+      + card('sm', 'Platform', esc(t.host.platform))
+      + card('sm', 'CPUs', t.host.cpus)
+      + card('sm', 'Port', t.proc.port)
+      + card('sm', 'Host', esc(t.host.hostname || '?'))
+      + card('sm', 'PID', t.proc.pid)
+      + '</div>';
   });
 }
 
 function loadIps(){
   fetch('/api/settings').then(function(r){ return r.json(); }).then(function(c){
-    q('ipList').value = (c.allowIps || []).join(', ');
+    IPS = (c.allowIps || []).slice();
+    drawIps();
     q('myIp').textContent = c.yourIp || '?';
     q('doorPin').placeholder = c.doorPinSet ? 'code set - type a new one to change' : 'door code (blank = no code)';
     q('doorPinMsg').innerHTML = c.doorPinSet
@@ -3963,11 +4116,36 @@ function loadIps(){
       : '<span style="color:var(--bad)">Empty list &mdash; the HR API is blocked for everyone.</span>';
   });
 }
-function useMyIp(){
-  var cur = q('ipList').value.trim();
-  var mine = q('myIp').textContent;
-  q('ipList').value = cur ? cur + ', ' + mine : mine;
+// The list on screen is the list in force: adding and removing write straight
+// through, so there is never a saved state and a shown state to tell apart.
+var IPS = [];
+
+function drawIps(){
+  q('ipRules').innerHTML = IPS.length
+    ? IPS.map(function(r, i){
+        return '<span class="rule">' + esc(r) + '<button title="Remove this rule" '
+          + 'onclick="dropIp(' + i + ')">&times;</button></span>';
+      }).join('')
+    : '<span class="hint">No rule yet &mdash; the HR API is blocked for everyone.</span>';
 }
+
+function addIp(rule){
+  var v = String(rule || q('ipNew').value || '').trim();
+  if (!v) return;
+  if (IPS.indexOf(v) >= 0){ q('ipNew').value = ''; return toast(v + ' is already on the list'); }
+  IPS.push(v);
+  q('ipNew').value = '';
+  saveIps();
+}
+
+function dropIp(i){
+  var gone = IPS[i];
+  if (!confirm('Remove ' + gone + ' from the allow-list?')) return;
+  IPS.splice(i, 1);
+  saveIps();
+}
+
+function useMyIp(){ addIp(q('myIp').textContent); }
 function saveDoorPin(){
   fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ doorPin: q('doorPin').value.trim() }) })
@@ -3987,9 +4165,9 @@ function saveRules(){
     });
 }
 function saveIps(){
-  var list = q('ipList').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+  drawIps();
   fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ allowIps: list }) })
+    body: JSON.stringify({ allowIps: IPS }) })
     .then(function(r){ return r.json(); })
     .then(function(j){
       loadIps();

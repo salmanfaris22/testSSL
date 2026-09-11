@@ -1,0 +1,7 @@
+# Enrolment portraits pulled off the terminals. These are photographs of real
+# people and this repository is on GitHub, so they stay on the server that
+# collected them.
+data/photos/
+
+# Copies the server makes before rewriting a store it did not recognise.
+*.server-backup
