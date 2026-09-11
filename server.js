@@ -1344,10 +1344,13 @@ function splitRow(line) {
 }
 
 // Two records for one human. A name is what a person is recognised by, and
-// case, punctuation and double spaces all vary between one roll and the next,
-// so none of them are allowed to hide a match.
+// case, punctuation and spacing all vary between one roll and the next - the
+// initials especially, which arrive as "T.S.", "T S" and "TS" for the same
+// person - so none of them are allowed to hide a match. Dropping the gaps
+// entirely can in principle read "RAJ U" as "RAJU", which is why a record
+// with a face enrolled on it is never removed without a deliberate tick.
 function nameKey(n) {
-  return cmdField(n).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+  return cmdField(n).toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
 // A duplicate is a flag, not a status: the line is still perfectly usable on
@@ -1357,6 +1360,66 @@ function markDup(row, pin) {
   row.dup = true;
   row.dupOf = row.dupOf || [];
   if (pin && row.dupOf.indexOf(pin) < 0) row.dupOf.push(pin);
+}
+
+// One person, two records. Which of the two is the real one is not a guess:
+// a record with a face enrolled is the one that opens the door, a record with
+// punches behind it is the one the reports are built from, and between two
+// that are equal the lower number is the one that was there first. A record
+// created by a mis-paste has none of those, which is why it sorts last and
+// gets removed rather than the original it shadows.
+function dupeGroups() {
+  const punches = new Map();
+  for (const r of state.logs) punches.set(r.pin, (punches.get(r.pin) || 0) + 1);
+  const hits = (u) => punches.get(String(u.pin)) || 0;
+  const faces = (u) => (u.bio && Object.keys(u.bio).length ? 1 : 0);
+  const rank = (u) => [faces(u), hits(u) ? 1 : 0, Number(u.privilege || 0), -Number(u.pin)];
+  const by = new Map();
+  for (const u of Object.values(state.users)) {
+    const k = nameKey(u.name);
+    if (!k) continue;                       // a nameless record has no twin to find
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(u);
+  }
+  const groups = [];
+  for (const list of by.values()) {
+    if (list.length < 2) continue;
+    list.sort((a, b) => {
+      const x = rank(a), y = rank(b);
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i] - x[i];
+      return 0;
+    });
+    const shape = (u) => ({
+      pin: String(u.pin), name: cmdField(u.name), punches: hits(u),
+      privilege: String(u.privilege || '0'), faces: !!faces(u),
+    });
+    const keep = shape(list[0]);
+    keep.why = [
+      faces(list[0]) ? 'face enrolled' : '',
+      hits(list[0]) ? hits(list[0]) + ' punch(es) on file' : '',
+      Number(list[0].privilege || 0) ? PRI_LABEL[String(list[0].privilege)] || 'privileged' : '',
+    ].filter(Boolean).join(', ') || 'the lower number, so the original';
+    groups.push({
+      name: keep.name,
+      keep,
+      // held back rather than hidden: removing either of these loses something
+      // the operator may not want to lose, so it takes a deliberate tick
+      drop: list.slice(1).map((u) => {
+        const d = shape(u);
+        d.holds = [];
+        if (d.faces) d.holds.push('face');
+        if (d.punches) d.holds.push('history');
+        if (d.privilege !== '0') d.holds.push('admin');
+        d.why = [
+          d.faces ? 'a face is enrolled on it' : '',
+          d.punches ? d.punches + ' punch(es) would stop being reported' : '',
+          d.privilege !== '0' ? (PRI_LABEL[d.privilege] || 'an admin') + ' record' : '',
+        ].filter(Boolean).join(', ');
+        return d;
+      }),
+    });
+  }
+  return groups.sort((a, b) => Number(a.keep.pin) - Number(b.keep.pin));
 }
 
 function hasLower(name) {
@@ -1862,6 +1925,66 @@ async function handleApi(req, res, route, q) {
     });
   }
 
+  // Two records for one person, and one of them has to go. dryRun lists every
+  // pair with the survivor already chosen and changes nothing. The apply never
+  // takes the browser's word for which PIN is disposable: the groups are built
+  // again here, and a PIN that is not a dropped twin in that fresh reading is
+  // refused however it was asked for.
+  if (route === '/api/users/dupes' && req.method === 'POST') {
+    let p = {};
+    try { p = JSON.parse((await readBody(req)) || '{}'); } catch (e) {}
+    const groups = dupeGroups();
+    const held = groups.reduce((n, g) => n + g.drop.filter((d) => d.holds.length).length, 0);
+    const free = groups.reduce((n, g) => n + g.drop.filter((d) => !d.holds.length).length, 0);
+    const preview = {
+      ok: true, dryRun: true, groups,
+      pairs: groups.length, removable: free, held,
+    };
+    if (p.dryRun) return jsonOut(res, preview);
+
+    const allowed = new Map();
+    for (const g of groups) {
+      for (const d of g.drop) {
+        if (d.holds.length && !p.includeHeld) continue;
+        allowed.set(d.pin, { keep: g.keep.pin, name: d.name });
+      }
+    }
+    const asked = Array.isArray(p.pins) && p.pins.length
+      ? p.pins.map((x) => normPin(x)) : [...allowed.keys()];
+    const wanted = [...new Set(asked)].filter((pin) => allowed.has(pin));
+    if (!wanted.length) {
+      return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
+        error: held && !free
+          ? 'every duplicate here is held back - tick the box to include them'
+          : 'no duplicate record to remove' }), 400);
+    }
+    const all = Object.keys(state.devices);
+    const online = all.filter((sn) => state.devices[sn].online);
+    const targets = p.sn ? [p.sn] : online;
+    if (!targets.length) {
+      return jsonOut(res, Object.assign({}, preview, { ok: false, dryRun: false,
+        error: 'no terminal is online right now - ' + all.length
+          + ' known device(s), none polling this server' }), 409);
+    }
+    const batch = ++importSeq;
+    const queued = [];
+    for (const pin of wanted) {
+      const gone = allowed.get(pin);
+      delete state.users[pin];
+      for (const sn of targets) {
+        queued.push(enqueue(sn, buildCommand('deluser', { pin }),
+          { kind: 'deluser', batch, pin }));
+      }
+      trace('info', '', 'duplicate removed: PIN ' + pin + ' "' + gone.name
+        + '" - kept PIN ' + gone.keep);
+    }
+    saveSoon();
+    return jsonOut(res, Object.assign({}, preview, {
+      dryRun: false, batch, targets, removed: wanted,
+      queued: queued.map((c) => ({ id: c.id, sn: c.sn, pin: c.pin })),
+    }));
+  }
+
   // Names stored in mixed case. They came in that way from an older paste or
   // from the terminal's own keypad, and they are the ones that read wrong next
   // to a roll typed in capitals. dryRun lists them and changes nothing; the
@@ -2046,6 +2169,9 @@ color:var(--dim);white-space:nowrap}
 .st.error{background:rgba(239,68,68,.12);color:#f87171;border-color:rgba(239,68,68,.3)}
 .st.dup{background:rgba(168,85,247,.16);color:#d8b4fe;border-color:rgba(168,85,247,.42)}
 .st.low{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
+.st.keep{background:rgba(34,197,94,.15);color:var(--ok);border-color:rgba(34,197,94,.35)}
+.st.drop{background:rgba(239,68,68,.12);color:#f87171;border-color:rgba(239,68,68,.3)}
+.st.hold{background:rgba(245,158,11,.13);color:var(--warn);border-color:rgba(245,158,11,.32)}
 /* a row the current pick would not send - still listed, visibly not going */
 #bRows tr.skip{opacity:.38}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:0 0 auto}
@@ -2241,10 +2367,18 @@ h1{font-size:15px}
         <input id="uq" placeholder="Filter users" style="width:170px" oninput="renderUsers()">
         <button id="uLow" onclick="toggleLower()">small letters</button>
         <button class="p" id="uFix" onclick="fixCase()">UPPERCASE</button>
+        <button id="uDup" onclick="toggleDupes()">duplicates</button>
+        <button class="d" id="uDrop" onclick="dropDupes()">Remove duplicates</button>
         <button onclick="cmd('queryuser')">Pull from device</button>
       </span>
     </h2>
     <div class="note" id="uMsg" style="padding:0 14px 8px"></div>
+    <div class="note" id="uHeld" style="padding:0 14px 8px;display:none">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input id="uHeldOn" type="checkbox" style="width:auto" onchange="renderUsers()">
+        <span id="uHeldTxt"></span>
+      </label>
+    </div>
     <div class="scroll" style="max-height:300px">
       <table><thead><tr><th>PIN</th><th>Name</th><th>Card</th><th>Privilege</th><th>Biometrics</th></tr></thead>
       <tbody id="tbUsers"></tbody></table>
@@ -2690,6 +2824,82 @@ function isLower(name){
 }
 
 var LOWONLY = false, CASE_TIMER = null;
+// what the server decided about each twin, pin -> {role, twin, why, holds}
+var DUPES = null, DUPONLY = false, DUP_ASKED = false;
+
+// The survivor is the server's call, not the browser's - asking for it keeps
+// one ranking in one place, and the list here only draws what came back.
+function loadDupes(then){
+  fetch('/api/users/dupes', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({dryRun:true})})
+    .then(function(r){ return r.json(); })
+    .catch(function(){ return null; })
+    .then(function(j){
+      if (!j || !j.ok) { userNote('could not read the duplicates'); return; }
+      DUPES = {};
+      j.groups.forEach(function(g){
+        DUPES[g.keep.pin] = {role:'keep', why:g.keep.why, holds:[],
+          twin:g.drop.map(function(d){ return d.pin; }).join(', ')};
+        g.drop.forEach(function(d){
+          DUPES[d.pin] = {role: d.holds.length ? 'hold' : 'drop', why:d.why,
+            holds:d.holds, twin:g.keep.pin};
+        });
+      });
+      DUPES.summary = {pairs:j.pairs, removable:j.removable, held:j.held};
+      renderUsers();
+      if (then) then(j);
+    });
+}
+
+function toggleDupes(){
+  DUPONLY = !DUPONLY;
+  if (DUPONLY && !DUPES) return loadDupes();
+  renderUsers();
+}
+
+// every PIN the Remove button would send, which is what the confirm lists
+function dropList(){
+  if (!DUPES) return [];
+  var held = q('uHeldOn').checked;
+  return visibleUsers().filter(function(u){
+    var d = DUPES[String(u.pin)];
+    return d && (d.role === 'drop' || (held && d.role === 'hold'));
+  });
+}
+
+function dropDupes(){
+  if (!DUPES) return loadDupes(function(){ userNote('duplicates read - press Remove again'); });
+  var rows = dropList();
+  if (!rows.length) return userNote(DUPES.summary && DUPES.summary.held
+    ? 'nothing to remove - ' + DUPES.summary.held + ' duplicate(s) are held back, tick the box to include them'
+    : 'no duplicate record to remove');
+  var lines = rows.slice(0, 6).map(function(u){
+    var d = DUPES[String(u.pin)];
+    return 'remove ' + u.pin + ' ' + u.name + '  (keeping ' + d.twin + ')'
+      + (d.holds.length ? '  - ' + d.why : '');
+  }).join('\\n');
+  if (!confirm('Remove ' + rows.length + ' duplicate record(s) from this server and from the '
+    + 'terminal?\\n\\n' + lines + (rows.length > 6 ? '\\n...and ' + (rows.length - 6) + ' more' : '')
+    + '\\n\\nThe face enrolled on a removed record goes with it.')) return;
+  q('uDrop').disabled = true;
+  userNote('removing ' + rows.length + ' record(s)...');
+  fetch('/api/users/dupes', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({pins: rows.map(function(u){ return String(u.pin); }),
+      includeHeld: q('uHeldOn').checked})})
+    .then(function(r){ return r.json(); })
+    .catch(function(){ return {ok:false, error:'server unreachable'}; })
+    .then(function(j){
+      if (!j.ok) { q('uDrop').disabled = false; return userNote(j.error || 'nothing was removed'); }
+      DUPES = null;
+      userNote('queued ' + j.queued.length + ' delete(s) for ' + j.targets.length
+        + ' terminal(s) - collected on the next poll.');
+      CASE_TIMER = setTimeout(function(){
+        bulkWatch(j.batch, Date.now() + 180000, userNote);
+      }, 1600);
+      refresh();
+      loadDupes();
+    });
+}
 
 function toggleLower(){
   LOWONLY = !LOWONLY;
@@ -2713,15 +2923,33 @@ function visibleUsers(){
       || String(u.name || '').toLowerCase().indexOf(term) >= 0;
   });
   if (LOWONLY) list = list.filter(function(u){ return isLower(u.name); });
+  if (DUPONLY) list = list.filter(function(u){ return DUPES && DUPES[String(u.pin)]; });
   return list;
 }
 
+// twins sit next to each other, survivor first, so a pair reads as a pair
+function byGroup(list){
+  if (!DUPONLY || !DUPES) return list;
+  return list.slice().sort(function(a, b){
+    var x = DUPES[String(a.pin)] || {}, y = DUPES[String(b.pin)] || {};
+    var ax = x.role === 'keep' ? a.pin : x.twin, ay = y.role === 'keep' ? b.pin : y.twin;
+    if (Number(ax) !== Number(ay)) return Number(ax) - Number(ay);
+    return (x.role === 'keep' ? 0 : 1) - (y.role === 'keep' ? 0 : 1);
+  });
+}
+
+var DUP_PILL = {keep:'keep', drop:'remove', hold:'held back'};
+
 function renderUsers(){
-  var list = visibleUsers();
+  var list = byGroup(visibleUsers());
   q('tbUsers').innerHTML = list.map(function(u){
     var bio = u.bio ? Object.keys(u.bio).join(', ') : '';
+    var d = DUPES && DUPES[String(u.pin)];
+    var dup = d ? ' <span class="st ' + d.role + '">' + DUP_PILL[d.role] + '</span>'
+      + ' <span class="hint">' + (d.role === 'keep' ? 'over PIN ' : 'twin of PIN ') + esc(d.twin)
+      + (d.why ? ' - ' + esc(d.why) : '') + '</span>' : '';
     return '<tr><td class="mono">' + esc(u.pin) + '</td><td>' + esc(u.name)
-      + (isLower(u.name) ? ' <span class="st low">small letters</span>' : '') + '</td>'
+      + (isLower(u.name) ? ' <span class="st low">small letters</span>' : '') + dup + '</td>'
       + '<td class="mono">' + esc(u.card || '') + '</td>'
       + '<td>' + esc(PRIVILEGE[u.privilege] || u.privilege || 'User') + '</td>'
       + '<td style="color:#8b949e">' + esc(bio) + '</td></tr>';
@@ -2732,10 +2960,24 @@ function renderUsers(){
   var n = lowerShown().length;
   q('uFix').disabled = !n;
   q('uFix').textContent = n ? 'UPPERCASE ' + n : 'UPPERCASE';
+  var sum = DUPES && DUPES.summary;
+  q('uDup').textContent = 'duplicates' + (sum ? ' ' + sum.pairs : '');
+  q('uDup').className = DUPONLY ? 'on' : '';
+  var gone = dropList().length;
+  q('uDrop').disabled = !!DUPES && !gone;
+  q('uDrop').className = 'd';
+  q('uDrop').textContent = gone ? 'Remove ' + gone : 'Remove duplicates';
+  // the held-back tick only appears when there is something behind it
+  q('uHeld').style.display = sum && sum.held ? 'block' : 'none';
+  if (sum && sum.held){
+    q('uHeldTxt').textContent = 'also remove ' + sum.held + ' duplicate(s) held back for '
+      + 'carrying a face, attendance history or an admin role';
+  }
   var empty = q('emptyUsers');
   empty.style.display = list.length ? 'none' : 'block';
   empty.innerHTML = (PEOPLE || []).length
-    ? (LOWONLY ? 'Every listed name is already in capitals.' : 'No user matches that filter.')
+    ? (LOWONLY ? 'Every listed name is already in capitals.'
+      : DUPONLY ? 'Nobody is on file twice.' : 'No user matches that filter.')
     : 'No users synced yet &mdash; press <b>Pull from device</b>.';
 }
 
@@ -2763,6 +3005,7 @@ function fixCase(){
         bulkWatch(j.batch, Date.now() + 180000, userNote);
       }, 1600);
       refresh();
+      loadDupes();
     });
 }
 
@@ -2865,6 +3108,9 @@ function render(s){
   q('emptyLogs').style.display = s.logs.length ? 'none' : 'block';
 
   PEOPLE = s.users;
+  // the survivor ranking walks the whole punch log, so it is read once here
+  // and again only after something has changed the records
+  if (!DUPES && !DUP_ASKED && PEOPLE.length){ DUP_ASKED = true; loadDupes(); }
   if (!q('aTo').value && !ATT_SEEDED){
     ATT_SEEDED = true;
     setRange('att', 0);               // open on everyone, today
@@ -3197,6 +3443,7 @@ function bulkPush(){
       + ' terminal(s) - collected on the next poll.');
     BULK_TIMER = setTimeout(function(){ bulkWatch(j.batch, Date.now() + 180000); }, 1600);
     refresh();
+    loadDupes();
   });
 }
 
