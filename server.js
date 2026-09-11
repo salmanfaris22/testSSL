@@ -430,7 +430,100 @@ function addPunch(sn, rawPin, devTime, status, verify, workcode, extra, offset) 
   state.logs.push(rec);
   try { fs.appendFileSync(ATT_FILE, JSON.stringify(rec) + '\n'); }
   catch (e) { trace('err', sn, 'attlog write: ' + e.message); }
+  // This line is reached once per genuinely new punch and never for a repeat,
+  // which is exactly the moment a listener wants to hear about.
+  feedPush(rec);
   return true;
+}
+
+/* ------------------------------------------------------------ live feed */
+
+// The stream. A listener opens this once and leaves it open, so nothing on
+// either side needs a Fetch button. Reachable under both names because the
+// two doors are the same door: allow-listed, keyed, and scoped to the people
+// the listener named. The caller has already checked both locks.
+function openFeed(req, res, q, route, t0) {
+  const pins = new Set(pinList(q, 'connect_id').concat(pinList(q)));
+  if (!pins.size) {
+    return jsonOut(res, { error: 'name the people with connect_id - a feed never '
+      + 'carries the whole roll' }, 400);
+  }
+  if (feeds.length >= FEED_MAX) {
+    return jsonOut(res, { error: 'too many open feeds', open: feeds.length }, 429);
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': '*',
+  });
+  const f = { res, ip: clientIp(req), pins, since: Date.now(), sent: 0 };
+  feeds.push(f);
+  res._hr = null;                       // a stream is not a call that returns rows
+  hrTrace(req, route, { pins: [...pins].join(','), rows: 0, ok: true, why: '',
+    ms: Date.now() - (t0 || Date.now()) });
+  trace('info', '', 'live feed opened by ' + f.ip + ' for ' + pins.size + ' person(s)');
+  feedSend(f, 'hello', { ok: true, pins: [...pins], since: f.since, recv: Date.now() });
+  // A reconnect names the last id it saw, and gets what it missed.
+  const last = Number(req.headers['last-event-id'] || q.get('since') || 0);
+  if (last) {
+    for (const frame of feedReplay) {
+      if (frame.recv > last && pins.has(frame.pin)) feedSend(f, 'punch', frame);
+    }
+  }
+  // idle proxies close a silent connection, so say something harmless
+  const beat = setInterval(() => {
+    try { res.write(': keep-alive\n\n'); } catch (e) { /* closing */ }
+  }, 20000);
+  const drop = () => {
+    clearInterval(beat);
+    const i = feeds.indexOf(f);
+    if (i >= 0) feeds.splice(i, 1);
+    trace('info', '', 'live feed closed for ' + f.ip + ' after ' + f.sent + ' event(s)');
+  };
+  req.on('close', drop);
+  req.on('error', drop);
+  return undefined;
+}
+
+// A listener that asked for nobody hears nobody: the PIN set is enforced here
+// rather than trusted to the far end.
+const FEED_MAX = 8;           // enough for every consumer, not enough to be a hole
+const FEED_REPLAY = 500;      // punches kept for a reconnect to catch up on
+const feedReplay = [];
+
+function feedFrame(rec) {
+  // The movement this punch belongs to cannot be known until the day is
+  // re-derived, so what goes out is the tap itself plus the day it lands in -
+  // the listener asks for the day when it wants the labelled version.
+  return {
+    pin: rec.pin, name: rec.name || '',
+    time: rec.time, recv: rec.recv, gate: rec.sn,
+    session_date: dayOf(rec.time), session_uid: rec.pin + '|' + dayOf(rec.time),
+    device_key: punchKey(rec),
+    verify: rec.verify, verified_by: VERIFY[rec.verify] || ('mode ' + rec.verify),
+    dir: dirOf(rec),
+  };
+}
+
+function feedPush(rec) {
+  const frame = feedFrame(rec);
+  feedReplay.push(frame);
+  if (feedReplay.length > FEED_REPLAY) feedReplay.splice(0, feedReplay.length - FEED_REPLAY);
+  for (const f of feeds) {
+    if (!f.pins.has(rec.pin)) continue;
+    feedSend(f, 'punch', frame);
+  }
+}
+
+function feedSend(f, event, data) {
+  try {
+    f.res.write('id: ' + (data.recv || Date.now()) + '\n'
+      + 'event: ' + event + '\n'
+      + 'data: ' + JSON.stringify(data) + '\n\n');
+    if (event === 'punch') f.sent++;
+  } catch (e) { /* the close handler will drop it */ }
 }
 
 function parseAttlog(sn, body) {
@@ -1912,6 +2005,8 @@ async function handleApi(req, res, route, q) {
       } });
     }
 
+    if (route === '/api/v1/sync/stream') return openFeed(req, res, q, route, t0);
+
     if (route === '/api/v1/sync/events') {
       // Empty means nobody here, not everybody. This feed exists to carry the
       // people the academy has connected, and a caller that names none of them
@@ -1949,6 +2044,12 @@ async function handleApi(req, res, route, q) {
       trace('err', '', 'HR API denied for ' + clientIp(req) + ' - ' + why);
       return jsonOut(res, { error: 'forbidden', ip: clientIp(req) }, 403);
     }
+    if (!keyOk(req)) {
+      hrTrace(req, route, { pins: q.get('pin') || '', ok: false,
+        why: 'wrong or missing API key', ms: Date.now() - t0 });
+      return jsonOut(res, { error: 'unauthorized' }, 401);
+    }
+    if (route === '/api/hr/stream') return openFeed(req, res, q, route, t0);
     res._hr = { req, route, pins: q.get('pin') || '', t0 };
     const today = localDate(new Date());
     const to = q.get('to') || today;
